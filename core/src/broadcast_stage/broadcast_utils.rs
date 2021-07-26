@@ -1,6 +1,7 @@
-use crate::poh_recorder::WorkingBankEntry;
 use crate::result::Result;
-use solana_ledger::entry::Entry;
+use solana_entry::entry::Entry;
+use solana_ledger::shred::Shred;
+use solana_poh::poh_recorder::WorkingBankEntry;
 use solana_runtime::bank::Bank;
 use solana_sdk::clock::Slot;
 use std::{
@@ -16,11 +17,15 @@ pub(super) struct ReceiveResults {
     pub last_tick_height: u64,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct UnfinishedSlotInfo {
     pub next_shred_index: u32,
     pub slot: Slot,
     pub parent: Slot,
+    // Data shreds buffered to make a batch of size
+    // MAX_DATA_SHREDS_PER_FEC_BLOCK.
+    pub(crate) data_shreds_buffer: Vec<Shred>,
+    pub(crate) fec_set_offset: u32, // See Shredder::fec_set_index.
 }
 
 /// This parameter tunes how many entries are received in one iteration of recv loop
@@ -92,7 +97,7 @@ mod tests {
         let bank0 = Arc::new(Bank::new(&genesis_config));
         let tx = system_transaction::transfer(
             &mint_keypair,
-            &Pubkey::new_rand(),
+            &solana_sdk::pubkey::new_rand(),
             1,
             genesis_config.hash(),
         );

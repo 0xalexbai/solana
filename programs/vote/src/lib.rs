@@ -1,4 +1,5 @@
-#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(specialization))]
+#![cfg_attr(RUSTC_WITH_SPECIALIZATION, feature(min_specialization))]
+#![allow(clippy::integer_arithmetic)]
 
 pub mod authorized_voters;
 pub mod vote_instruction;
@@ -9,6 +10,6 @@ pub mod vote_transaction;
 extern crate solana_metrics;
 
 #[macro_use]
-extern crate solana_sdk_macro_frozen_abi;
+extern crate solana_frozen_abi_macro;
 
-solana_sdk::declare_id!("Vote111111111111111111111111111111111111111");
+pub use solana_sdk::vote::program::{check_id, id};

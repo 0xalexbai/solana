@@ -1,7 +1,9 @@
-import { object, any, StructType, string } from "superstruct";
+/* eslint-disable @typescript-eslint/no-redeclare */
 
-export type ParsedInfo = StructType<typeof ParsedInfo>;
-export const ParsedInfo = object({
+import { type, any, Infer, string } from "superstruct";
+
+export type ParsedInfo = Infer<typeof ParsedInfo>;
+export const ParsedInfo = type({
   type: string(),
   info: any(),
 });

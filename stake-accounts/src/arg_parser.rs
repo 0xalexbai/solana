@@ -13,13 +13,7 @@ use std::ffi::OsString;
 use std::process::exit;
 
 fn fee_payer_arg<'a, 'b>() -> Arg<'a, 'b> {
-    Arg::with_name("fee_payer")
-        .long("fee-payer")
-        .required(true)
-        .takes_value(true)
-        .value_name("KEYPAIR")
-        .validator(is_valid_signer)
-        .help("Fee payer")
+    solana_clap_utils::fee_payer::fee_payer_arg().required(true)
 }
 
 fn funding_keypair_arg<'a, 'b>() -> Arg<'a, 'b> {
@@ -155,7 +149,7 @@ where
                 .global(true)
                 .takes_value(true)
                 .value_name("URL")
-                .help("RPC entrypoint address. i.e. http://devnet.solana.com"),
+                .help("RPC entrypoint address. i.e. http://api.devnet.solana.com"),
         )
         .subcommand(
             SubCommand::with_name("new")

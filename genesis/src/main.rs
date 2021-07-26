@@ -1,29 +1,31 @@
 //! A command-line executable for generating the chain's genesis config.
+#![allow(clippy::integer_arithmetic)]
 
 use clap::{crate_description, crate_name, value_t, value_t_or_exit, App, Arg, ArgMatches};
 use solana_clap_utils::{
-    input_parsers::{pubkey_of, pubkeys_of, unix_timestamp_from_rfc3339_datetime},
-    input_validators::{is_pubkey_or_keypair, is_rfc3339_datetime, is_valid_percentage},
+    input_parsers::{cluster_type_of, pubkey_of, pubkeys_of, unix_timestamp_from_rfc3339_datetime},
+    input_validators::{is_pubkey_or_keypair, is_rfc3339_datetime, is_slot, is_valid_percentage},
 };
+use solana_entry::poh::compute_hashes_per_tick;
 use solana_genesis::{genesis_accounts::add_genesis_accounts, Base64Account};
-use solana_ledger::{
-    blockstore::create_new_ledger, blockstore_db::AccessType, poh::compute_hashes_per_tick,
-};
+use solana_ledger::{blockstore::create_new_ledger, blockstore_db::AccessType};
 use solana_runtime::hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE;
 use solana_sdk::{
-    account::Account,
+    account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
     clock,
     epoch_schedule::EpochSchedule,
     fee_calculator::FeeRateGovernor,
-    genesis_config::{GenesisConfig, OperatingMode},
+    genesis_config::{ClusterType, GenesisConfig},
+    inflation::Inflation,
     native_token::sol_to_lamports,
     poh_config::PohConfig,
     pubkey::Pubkey,
     rent::Rent,
     signature::{Keypair, Signer},
+    stake::state::StakeState,
     system_program, timing,
 };
-use solana_stake_program::stake_state::{self, StakeState};
+use solana_stake_program::stake_state;
 use solana_vote_program::vote_state::{self, VoteState};
 use std::{
     collections::HashMap,
@@ -73,17 +75,19 @@ pub fn load_genesis_accounts(file: &str, genesis_config: &mut GenesisConfig) -> 
             )
         })?;
 
-        let mut account = Account::new(account_details.balance, 0, &owner_program_id);
+        let mut account = AccountSharedData::new(account_details.balance, 0, &owner_program_id);
         if account_details.data != "~" {
-            account.data = base64::decode(account_details.data.as_str()).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Invalid account data: {}: {:?}", account_details.data, err),
-                )
-            })?;
+            account.set_data(
+                base64::decode(account_details.data.as_str()).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Invalid account data: {}: {:?}", account_details.data, err),
+                    )
+                })?,
+            );
         }
-        account.executable = account_details.executable;
-        lamports += account.lamports;
+        account.set_executable(account_details.executable);
+        lamports += account.lamports();
         genesis_config.add_account(pubkey, account);
     }
 
@@ -92,6 +96,7 @@ pub fn load_genesis_accounts(file: &str, genesis_config: &mut GenesisConfig) -> 
 
 #[allow(clippy::cognitive_complexity)]
 fn main() -> Result<(), Box<dyn error::Error>> {
+    let default_faucet_pubkey = solana_cli_config::Config::default().keypair_path;
     let fee_rate_governor = FeeRateGovernor::default();
     let (
         default_target_lamports_per_signature,
@@ -130,7 +135,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let default_target_tick_duration =
         timing::duration_as_us(&PohConfig::default().target_tick_duration);
     let default_ticks_per_slot = &clock::DEFAULT_TICKS_PER_SLOT.to_string();
-    let default_operating_mode = "stable";
+    let default_cluster_type = "mainnet-beta";
     let default_genesis_archive_unpacked_size = MAX_GENESIS_ARCHIVE_UNPACKED_SIZE.to_string();
 
     let matches = App::new(crate_name!())
@@ -171,7 +176,6 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .long("faucet-lamports")
                 .value_name("LAMPORTS")
                 .takes_value(true)
-                .requires("faucet_pubkey")
                 .help("Number of lamports to assign to the faucet"),
         )
         .arg(
@@ -182,6 +186,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .takes_value(true)
                 .validator(is_pubkey_or_keypair)
                 .requires("faucet_lamports")
+                .default_value(&default_faucet_pubkey)
                 .help("Path to file containing the faucet's pubkey"),
         )
         .arg(
@@ -263,6 +268,15 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .validator(is_valid_percentage),
         )
         .arg(
+            Arg::with_name("vote_commission_percentage")
+                .long("vote-commission-percentage")
+                .value_name("NUMBER")
+                .takes_value(true)
+                .default_value("100")
+                .help("percentage of vote commission")
+                .validator(is_valid_percentage),
+        )
+        .arg(
             Arg::with_name("target_signatures_per_slot")
                 .long("target-signatures-per-slot")
                 .value_name("NUMBER")
@@ -307,6 +321,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             Arg::with_name("slots_per_epoch")
                 .long("slots-per-epoch")
                 .value_name("SLOTS")
+                .validator(is_slot)
                 .takes_value(true)
                 .help("The number of slots in an epoch"),
         )
@@ -327,13 +342,11 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .help("The location of pubkey for primordial accounts and balance"),
         )
         .arg(
-            Arg::with_name("operating_mode")
-                .long("operating-mode")
-                .possible_value("development")
-                .possible_value("preview")
-                .possible_value("stable")
+            Arg::with_name("cluster_type")
+                .long("cluster-type")
+                .possible_values(&ClusterType::STRINGS)
                 .takes_value(true)
-                .default_value(default_operating_mode)
+                .default_value(default_cluster_type)
                 .help(
                     "Selects the features that will be enabled for the cluster"
                 ),
@@ -357,9 +370,16 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                 .multiple(true)
                 .help("Install a BPF program at the given address"),
         )
+        .arg(
+            Arg::with_name("inflation")
+                .required(false)
+                .long("inflation")
+                .takes_value(true)
+                .possible_values(&["pico", "full", "none"])
+                .help("Selects inflation"),
+        )
         .get_matches();
 
-    let faucet_lamports = value_t!(matches, "faucet_lamports", u64).unwrap_or(0);
     let ledger_path = PathBuf::from(matches.value_of("ledger_path").unwrap());
 
     let rent = Rent {
@@ -409,6 +429,7 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
     let bootstrap_stake_authorized_pubkey =
         pubkey_of(&matches, "bootstrap_stake_authorized_pubkey");
+    let faucet_lamports = value_t!(matches, "faucet_lamports", u64).unwrap_or(0);
     let faucet_pubkey = pubkey_of(&matches, "faucet_pubkey");
 
     let ticks_per_slot = value_t_or_exit!(matches, "ticks_per_slot", u64);
@@ -419,30 +440,26 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     );
     fee_rate_governor.burn_percent = value_t_or_exit!(matches, "fee_burn_percentage", u8);
 
-    let mut poh_config = PohConfig::default();
-    poh_config.target_tick_duration = if matches.is_present("target_tick_duration") {
-        Duration::from_micros(value_t_or_exit!(matches, "target_tick_duration", u64))
-    } else {
-        Duration::from_micros(default_target_tick_duration)
+    let mut poh_config = PohConfig {
+        target_tick_duration: if matches.is_present("target_tick_duration") {
+            Duration::from_micros(value_t_or_exit!(matches, "target_tick_duration", u64))
+        } else {
+            Duration::from_micros(default_target_tick_duration)
+        },
+        ..PohConfig::default()
     };
 
-    let operating_mode = match matches.value_of("operating_mode").unwrap() {
-        "development" => OperatingMode::Development,
-        "stable" => OperatingMode::Stable,
-        "preview" => OperatingMode::Preview,
-        _ => unreachable!(),
-    };
+    let cluster_type = cluster_type_of(&matches, "cluster_type").unwrap();
 
     match matches.value_of("hashes_per_tick").unwrap() {
-        "auto" => match operating_mode {
-            OperatingMode::Development => {
+        "auto" => match cluster_type {
+            ClusterType::Development => {
                 let hashes_per_tick =
                     compute_hashes_per_tick(poh_config.target_tick_duration, 1_000_000);
-                poh_config.hashes_per_tick = Some(hashes_per_tick);
+                poh_config.hashes_per_tick = Some(hashes_per_tick / 2); // use 50% of peak ability
             }
-            OperatingMode::Stable | OperatingMode::Preview => {
-                poh_config.hashes_per_tick =
-                    Some(clock::DEFAULT_HASHES_PER_SECOND / clock::DEFAULT_TICKS_PER_SECOND);
+            ClusterType::Devnet | ClusterType::Testnet | ClusterType::MainnetBeta => {
+                poh_config.hashes_per_tick = Some(clock::DEFAULT_HASHES_PER_TICK);
             }
         },
         "sleep" => {
@@ -456,9 +473,11 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     let slots_per_epoch = if matches.value_of("slots_per_epoch").is_some() {
         value_t_or_exit!(matches, "slots_per_epoch", u64)
     } else {
-        match operating_mode {
-            OperatingMode::Development => clock::DEFAULT_DEV_SLOTS_PER_EPOCH,
-            OperatingMode::Stable | OperatingMode::Preview => clock::DEFAULT_SLOTS_PER_EPOCH,
+        match cluster_type {
+            ClusterType::Development => clock::DEFAULT_DEV_SLOTS_PER_EPOCH,
+            ClusterType::Devnet | ClusterType::Testnet | ClusterType::MainnetBeta => {
+                clock::DEFAULT_SLOTS_PER_EPOCH
+            }
         }
     };
     let epoch_schedule = EpochSchedule::custom(
@@ -467,21 +486,28 @@ fn main() -> Result<(), Box<dyn error::Error>> {
         matches.is_present("enable_warmup_epochs"),
     );
 
-    let native_instruction_processors =
-        solana_genesis_programs::get_native_programs_for_genesis(operating_mode);
-    let inflation = solana_genesis_programs::get_inflation(operating_mode, 0).unwrap();
-
     let mut genesis_config = GenesisConfig {
-        native_instruction_processors,
+        native_instruction_processors: vec![],
         ticks_per_slot,
-        epoch_schedule,
-        inflation,
+        poh_config,
         fee_rate_governor,
         rent,
-        poh_config,
-        operating_mode,
+        epoch_schedule,
+        cluster_type,
         ..GenesisConfig::default()
     };
+
+    if let Ok(raw_inflation) = value_t!(matches, "inflation", String) {
+        let inflation = match raw_inflation.as_str() {
+            "pico" => Inflation::pico(),
+            "full" => Inflation::full(),
+            "none" => Inflation::new_disabled(),
+            _ => unreachable!(),
+        };
+        genesis_config.inflation = inflation;
+    }
+
+    let commission = value_t_or_exit!(matches, "vote_commission_percentage", u8);
 
     let mut bootstrap_validator_pubkeys_iter = bootstrap_validator_pubkeys.iter();
     loop {
@@ -494,14 +520,14 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 
         genesis_config.add_account(
             *identity_pubkey,
-            Account::new(bootstrap_validator_lamports, 0, &system_program::id()),
+            AccountSharedData::new(bootstrap_validator_lamports, 0, &system_program::id()),
         );
 
         let vote_account = vote_state::create_account_with_authorized(
-            &identity_pubkey,
-            &identity_pubkey,
-            &identity_pubkey,
-            100,
+            identity_pubkey,
+            identity_pubkey,
+            identity_pubkey,
+            commission,
             VoteState::get_rent_exempt_reserve(&rent).max(1),
         );
 
@@ -510,8 +536,8 @@ fn main() -> Result<(), Box<dyn error::Error>> {
             stake_state::create_account(
                 bootstrap_stake_authorized_pubkey
                     .as_ref()
-                    .unwrap_or(&identity_pubkey),
-                &vote_pubkey,
+                    .unwrap_or(identity_pubkey),
+                vote_pubkey,
                 &vote_account,
                 &rent,
                 bootstrap_validator_stake_lamports,
@@ -528,11 +554,14 @@ fn main() -> Result<(), Box<dyn error::Error>> {
     if let Some(faucet_pubkey) = faucet_pubkey {
         genesis_config.add_account(
             faucet_pubkey,
-            Account::new(faucet_lamports, 0, &system_program::id()),
+            AccountSharedData::new(faucet_lamports, 0, &system_program::id()),
         );
     }
 
     solana_stake_program::add_genesis_accounts(&mut genesis_config);
+    if genesis_config.cluster_type == ClusterType::Development {
+        solana_runtime::genesis_utils::activate_all_features(&mut genesis_config);
+    }
 
     if let Some(files) = matches.values_of("primordial_accounts_file") {
         for file in files {
@@ -575,13 +604,13 @@ fn main() -> Result<(), Box<dyn error::Error>> {
                         });
                     genesis_config.add_account(
                         address,
-                        Account {
+                        AccountSharedData::from(Account {
                             lamports: genesis_config.rent.minimum_balance(program_data.len()),
                             data: program_data,
                             executable: true,
                             owner: loader,
                             rent_epoch: 0,
-                        },
+                        }),
                     );
                 }
                 _ => unreachable!(),
@@ -605,7 +634,6 @@ fn main() -> Result<(), Box<dyn error::Error>> {
 mod tests {
     use super::*;
     use solana_sdk::genesis_config::GenesisConfig;
-    use solana_sdk::pubkey::Pubkey;
     use std::collections::HashMap;
     use std::fs::remove_file;
     use std::io::Write;
@@ -620,28 +648,28 @@ mod tests {
 
         let mut genesis_accounts = HashMap::new();
         genesis_accounts.insert(
-            Pubkey::new_rand().to_string(),
+            solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 2 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 2,
                 executable: false,
                 data: String::from("aGVsbG8="),
             },
         );
         genesis_accounts.insert(
-            Pubkey::new_rand().to_string(),
+            solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 1 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 1,
                 executable: true,
                 data: String::from("aGVsbG8gd29ybGQ="),
             },
         );
         genesis_accounts.insert(
-            Pubkey::new_rand().to_string(),
+            solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 3 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 3,
                 executable: true,
                 data: String::from("bWUgaGVsbG8gdG8gd29ybGQ="),
             },
@@ -693,28 +721,28 @@ mod tests {
         // Test more accounts can be appended
         let mut genesis_accounts1 = HashMap::new();
         genesis_accounts1.insert(
-            Pubkey::new_rand().to_string(),
+            solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 6 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 6,
                 executable: true,
                 data: String::from("eW91IGFyZQ=="),
             },
         );
         genesis_accounts1.insert(
-            Pubkey::new_rand().to_string(),
+            solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 5 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 5,
                 executable: false,
                 data: String::from("bWV0YSBzdHJpbmc="),
             },
         );
         genesis_accounts1.insert(
-            Pubkey::new_rand().to_string(),
+            solana_sdk::pubkey::new_rand().to_string(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 10 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 10,
                 executable: false,
                 data: String::from("YmFzZTY0IHN0cmluZw=="),
             },
@@ -744,7 +772,7 @@ mod tests {
             let pubkey = &pubkey_str.parse().unwrap();
             assert_eq!(
                 b64_account.balance,
-                genesis_config.accounts[&pubkey].lamports,
+                genesis_config.accounts[pubkey].lamports,
             );
         }
 
@@ -778,8 +806,8 @@ mod tests {
         genesis_accounts2.insert(
             serde_json::to_string(&account_keypairs[0].to_bytes().to_vec()).unwrap(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 20 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 20,
                 executable: true,
                 data: String::from("Y2F0IGRvZw=="),
             },
@@ -787,8 +815,8 @@ mod tests {
         genesis_accounts2.insert(
             serde_json::to_string(&account_keypairs[1].to_bytes().to_vec()).unwrap(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 15 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 15,
                 executable: false,
                 data: String::from("bW9ua2V5IGVsZXBoYW50"),
             },
@@ -796,8 +824,8 @@ mod tests {
         genesis_accounts2.insert(
             serde_json::to_string(&account_keypairs[2].to_bytes().to_vec()).unwrap(),
             Base64Account {
-                owner: Pubkey::new_rand().to_string(),
-                balance: 30 as u64,
+                owner: solana_sdk::pubkey::new_rand().to_string(),
+                balance: 30,
                 executable: true,
                 data: String::from("Y29tYSBtb2Nh"),
             },

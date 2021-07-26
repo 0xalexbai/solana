@@ -1,12 +1,12 @@
 import React from "react";
-import { SupplyProvider } from "./supply";
 import { LargestAccountsProvider } from "./largest";
+import { TokenRegistryProvider } from "./token-registry";
 
 type ProviderProps = { children: React.ReactNode };
 export function MintsProvider({ children }: ProviderProps) {
   return (
-    <SupplyProvider>
+    <TokenRegistryProvider>
       <LargestAccountsProvider>{children}</LargestAccountsProvider>
-    </SupplyProvider>
+    </TokenRegistryProvider>
   );
 }

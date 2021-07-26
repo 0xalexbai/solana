@@ -1,4 +1,4 @@
-import React from "react";
+import React, { ChangeEvent } from "react";
 import { Link, useHistory, useLocation } from "react-router-dom";
 import { useDebounceCallback } from "@react-hook/debounce";
 import { Location } from "history";
@@ -13,13 +13,24 @@ import {
   useClusterModal,
   useUpdateCustomUrl,
 } from "providers/cluster";
-import { assertUnreachable } from "../utils";
+import { assertUnreachable, localStorageIsAvailable } from "../utils";
 import { Overlay } from "./common/Overlay";
 import { useQuery } from "utils/url";
 
 export function ClusterModal() {
   const [show, setShow] = useClusterModal();
   const onClose = () => setShow(false);
+  const showDeveloperSettings = localStorageIsAvailable();
+  const enableCustomUrl =
+    showDeveloperSettings && localStorage.getItem("enableCustomUrl") !== null;
+  const onToggleCustomUrlFeature = (e: ChangeEvent<HTMLInputElement>) => {
+    if (e.target.checked) {
+      localStorage.setItem("enableCustomUrl", "");
+    } else {
+      localStorage.removeItem("enableCustomUrl");
+    }
+  };
+
   return (
     <>
       <div
@@ -34,8 +45,35 @@ export function ClusterModal() {
               </span>
 
               <h2 className="text-center mb-4 mt-4">Choose a Cluster</h2>
-
               <ClusterToggle />
+
+              {showDeveloperSettings && (
+                <>
+                  <hr />
+
+                  <h2 className="text-center mb-4 mt-4">Developer Settings</h2>
+                  <div className="d-flex justify-content-between">
+                    <span className="mr-3">Enable custom url param</span>
+                    <div className="custom-control custom-switch d-inline">
+                      <input
+                        type="checkbox"
+                        defaultChecked={enableCustomUrl}
+                        className="custom-control-input"
+                        id="cardToggle"
+                        onChange={onToggleCustomUrlFeature}
+                      />
+                      <label
+                        className="custom-control-label"
+                        htmlFor="cardToggle"
+                      ></label>
+                    </div>
+                  </div>
+                  <p className="text-muted font-size-sm mt-3">
+                    Enable this setting to easily connect to a custom cluster
+                    via the "customUrl" url param.
+                  </p>
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -59,7 +97,10 @@ function CustomClusterInput({ activeSuffix, active }: InputProps) {
     active ? `${prefix}-${activeSuffix}` : "";
 
   const clusterLocation = (location: Location) => {
-    if (customUrl.length > 0) query.set("cluster", "custom");
+    if (customUrl.length > 0) {
+      query.set("cluster", "custom");
+      query.set("customUrl", customUrl);
+    }
     return {
       ...location,
       search: query.toString(),
@@ -70,6 +111,7 @@ function CustomClusterInput({ activeSuffix, active }: InputProps) {
     updateCustomUrl(url);
     if (url.length > 0) {
       query.set("cluster", "custom");
+      query.set("customUrl", url);
       history.push({ ...location, search: query.toString() });
     }
   }, 500);
@@ -156,7 +198,7 @@ function ClusterToggle() {
           >
             {`${clusterName(net)}: `}
             <span className="text-muted d-inline-block">
-              {clusterUrl(net, customUrl)}
+              {clusterUrl(net, customUrl).replace("explorer-", "")}
             </span>
           </Link>
         );

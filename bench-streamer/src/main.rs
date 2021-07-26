@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 use clap::{crate_description, crate_name, App, Arg};
 use solana_streamer::packet::{Packet, Packets, PacketsRecycler, PACKET_DATA_SIZE};
 use solana_streamer::streamer::{receiver, PacketReceiver};
@@ -17,7 +18,7 @@ fn producer(addr: &SocketAddr, exit: Arc<AtomicBool>) -> JoinHandle<()> {
     msgs.packets.resize(10, Packet::default());
     for w in msgs.packets.iter_mut() {
         w.meta.size = PACKET_DATA_SIZE;
-        w.meta.set_addr(&addr);
+        w.meta.set_addr(addr);
     }
     let msgs = Arc::new(msgs);
     spawn(move || loop {
@@ -27,7 +28,7 @@ fn producer(addr: &SocketAddr, exit: Arc<AtomicBool>) -> JoinHandle<()> {
         let mut num = 0;
         for p in &msgs.packets {
             let a = p.meta.addr();
-            assert!(p.meta.size < PACKET_DATA_SIZE);
+            assert!(p.meta.size <= PACKET_DATA_SIZE);
             send.send_to(&p.data[..p.meta.size], &a).unwrap();
             num += 1;
         }
@@ -90,6 +91,8 @@ fn main() -> Result<()> {
             s_reader,
             recycler.clone(),
             "bench-streamer-test",
+            1,
+            true,
         ));
     }
 

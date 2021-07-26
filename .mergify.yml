@@ -4,6 +4,18 @@
 #
 # https://doc.mergify.io/
 pull_request_rules:
+  - name: label changes from community
+    conditions:
+      - author≠@core-contributors
+      - author≠mergify[bot]
+      - author≠dependabot[bot]
+    actions:
+      label:
+        add:
+          - community
+      request_reviews:
+        teams:
+          - "@solana-labs/community-pr-subscribers"
   - name: automatic merge (squash) on CI success
     conditions:
       - status-success=buildkite/solana
@@ -50,27 +62,35 @@ pull_request_rules:
       label:
         add:
           - automerge
-  - name: v1.2 backport
+  - name: v1.6 backport
     conditions:
-      - label=v1.2
+      - label=v1.6
     actions:
       backport:
         ignore_conflicts: true
         branches:
-          - v1.2
-  - name: v1.3 backport
+          - v1.6
+  - name: v1.7 backport
     conditions:
-      - label=v1.3
+      - label=v1.7
     actions:
       backport:
         ignore_conflicts: true
         branches:
-          - v1.3
-  - name: v1.4 backport
+          - v1.7
+  - name: v1.8 backport
     conditions:
-      - label=v1.4
+      - label=v1.8
     actions:
       backport:
         ignore_conflicts: true
         branches:
-          - v1.4
+          - v1.8
+  - name: v1.9 backport
+    conditions:
+      - label=v1.9
+    actions:
+      backport:
+        ignore_conflicts: true
+        branches:
+          - v1.9

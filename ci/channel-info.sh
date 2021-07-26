@@ -95,12 +95,20 @@ elif [[ -n $CI_BRANCH ]]; then
   BRANCH="$CI_BRANCH"
 fi
 
-if [[ $BRANCH = "$STABLE_CHANNEL" ]]; then
-  CHANNEL=stable
-elif [[ $BRANCH = "$EDGE_CHANNEL" ]]; then
-  CHANNEL=edge
-elif [[ $BRANCH = "$BETA_CHANNEL" ]]; then
-  CHANNEL=beta
+if [[ -z "$CHANNEL" ]]; then
+  if [[ $BRANCH = "$STABLE_CHANNEL" ]]; then
+    CHANNEL=stable
+  elif [[ $BRANCH = "$EDGE_CHANNEL" ]]; then
+    CHANNEL=edge
+  elif [[ $BRANCH = "$BETA_CHANNEL" ]]; then
+    CHANNEL=beta
+  fi
+fi
+
+if [[ $CHANNEL = beta ]]; then
+  CHANNEL_LATEST_TAG="$BETA_CHANNEL_LATEST_TAG"
+elif [[ $CHANNEL = stable ]]; then
+  CHANNEL_LATEST_TAG="$STABLE_CHANNEL_LATEST_TAG"
 fi
 
 echo EDGE_CHANNEL="$EDGE_CHANNEL"
@@ -109,5 +117,6 @@ echo BETA_CHANNEL_LATEST_TAG="$BETA_CHANNEL_LATEST_TAG"
 echo STABLE_CHANNEL="$STABLE_CHANNEL"
 echo STABLE_CHANNEL_LATEST_TAG="$STABLE_CHANNEL_LATEST_TAG"
 echo CHANNEL="$CHANNEL"
+echo CHANNEL_LATEST_TAG="$CHANNEL_LATEST_TAG"
 
 exit 0

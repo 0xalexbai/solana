@@ -1,18 +1,24 @@
-use crate::keypair::{
-    keypair_from_seed_phrase, pubkey_from_path, resolve_signer_from_path, signer_from_path,
-    ASK_KEYWORD, SKIP_SEED_PHRASE_VALIDATION_ARG,
+use {
+    crate::keypair::{
+        keypair_from_seed_phrase, pubkey_from_path, resolve_signer_from_path, signer_from_path,
+        ASK_KEYWORD, SKIP_SEED_PHRASE_VALIDATION_ARG,
+    },
+    chrono::DateTime,
+    clap::ArgMatches,
+    solana_remote_wallet::remote_wallet::RemoteWalletManager,
+    solana_sdk::{
+        clock::UnixTimestamp,
+        commitment_config::CommitmentConfig,
+        genesis_config::ClusterType,
+        native_token::sol_to_lamports,
+        pubkey::Pubkey,
+        signature::{read_keypair_file, Keypair, Signature, Signer},
+    },
+    std::{str::FromStr, sync::Arc},
 };
-use chrono::DateTime;
-use clap::ArgMatches;
-use solana_remote_wallet::remote_wallet::RemoteWalletManager;
-use solana_sdk::{
-    clock::UnixTimestamp,
-    commitment_config::CommitmentConfig,
-    native_token::sol_to_lamports,
-    pubkey::Pubkey,
-    signature::{read_keypair_file, Keypair, Signature, Signer},
-};
-use std::{str::FromStr, sync::Arc};
+
+// Sentinel value used to indicate to write to screen instead of file
+pub const STDOUT_OUTFILE_TOKEN: &str = "-";
 
 // Return parsed values from matches at `name`
 pub fn values_of<T>(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<T>>
@@ -54,7 +60,7 @@ pub fn keypair_of(matches: &ArgMatches<'_>, name: &str) -> Option<Keypair> {
     if let Some(value) = matches.value_of(name) {
         if value == ASK_KEYWORD {
             let skip_validation = matches.is_present(SKIP_SEED_PHRASE_VALIDATION_ARG.name);
-            keypair_from_seed_phrase(name, skip_validation, true).ok()
+            keypair_from_seed_phrase(name, skip_validation, true, None, true).ok()
         } else {
             read_keypair_file(value).ok()
         }
@@ -69,7 +75,7 @@ pub fn keypairs_of(matches: &ArgMatches<'_>, name: &str) -> Option<Vec<Keypair>>
             .filter_map(|value| {
                 if value == ASK_KEYWORD {
                     let skip_validation = matches.is_present(SKIP_SEED_PHRASE_VALIDATION_ARG.name);
-                    keypair_from_seed_phrase(name, skip_validation, true).ok()
+                    keypair_from_seed_phrase(name, skip_validation, true, None, true).ok()
                 } else {
                     read_keypair_file(value).ok()
                 }
@@ -166,26 +172,26 @@ pub fn resolve_signer(
     name: &str,
     wallet_manager: &mut Option<Arc<RemoteWalletManager>>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    Ok(resolve_signer_from_path(
+    resolve_signer_from_path(
         matches,
         matches.value_of(name).unwrap(),
         name,
         wallet_manager,
-    )?)
+    )
 }
 
 pub fn lamports_of_sol(matches: &ArgMatches<'_>, name: &str) -> Option<u64> {
     value_of(matches, name).map(sol_to_lamports)
 }
 
+pub fn cluster_type_of(matches: &ArgMatches<'_>, name: &str) -> Option<ClusterType> {
+    value_of(matches, name)
+}
+
 pub fn commitment_of(matches: &ArgMatches<'_>, name: &str) -> Option<CommitmentConfig> {
-    matches.value_of(name).map(|value| match value {
-        "max" => CommitmentConfig::max(),
-        "recent" => CommitmentConfig::recent(),
-        "root" => CommitmentConfig::root(),
-        "single" => CommitmentConfig::single(),
-        _ => CommitmentConfig::default(),
-    })
+    matches
+        .value_of(name)
+        .map(|value| CommitmentConfig::from_str(value).unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -223,8 +229,8 @@ mod tests {
         assert_eq!(values_of(&matches, "multiple"), Some(vec![50, 39]));
         assert_eq!(values_of::<u64>(&matches, "single"), None);
 
-        let pubkey0 = Pubkey::new_rand();
-        let pubkey1 = Pubkey::new_rand();
+        let pubkey0 = solana_sdk::pubkey::new_rand();
+        let pubkey1 = solana_sdk::pubkey::new_rand();
         let matches = app().clone().get_matches_from(vec![
             "test",
             "--multiple",
@@ -246,7 +252,7 @@ mod tests {
         assert_eq!(value_of(&matches, "single"), Some(50));
         assert_eq!(value_of::<u64>(&matches, "multiple"), None);
 
-        let pubkey = Pubkey::new_rand();
+        let pubkey = solana_sdk::pubkey::new_rand();
         let matches = app()
             .clone()
             .get_matches_from(vec!["test", "--single", &pubkey.to_string()]);
@@ -326,8 +332,8 @@ mod tests {
 
     #[test]
     fn test_pubkeys_sigs_of() {
-        let key1 = Pubkey::new_rand();
-        let key2 = Pubkey::new_rand();
+        let key1 = solana_sdk::pubkey::new_rand();
+        let key2 = solana_sdk::pubkey::new_rand();
         let sig1 = Keypair::new().sign_message(&[0u8]);
         let sig2 = Keypair::new().sign_message(&[1u8]);
         let signer1 = format!("{}={}", key1, sig1);

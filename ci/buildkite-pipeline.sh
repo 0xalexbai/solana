@@ -148,6 +148,33 @@ all_test_steps() {
   command_step stable ". ci/rust-version.sh; ci/docker-run.sh \$\$rust_stable_docker_image ci/test-stable.sh" 60
   wait_step
 
+  # BPF test suite
+  if affects \
+             .rs$ \
+             Cargo.lock$ \
+             Cargo.toml$ \
+             ^ci/rust-version.sh \
+             ^ci/test-stable-bpf.sh \
+             ^ci/test-stable.sh \
+             ^ci/test-local-cluster.sh \
+             ^core/build.rs \
+             ^fetch-perf-libs.sh \
+             ^programs/ \
+             ^sdk/ \
+      ; then
+    cat >> "$output_file" <<"EOF"
+  - command: "ci/test-stable-bpf.sh"
+    name: "stable-bpf"
+    timeout_in_minutes: 20
+    artifact_paths: "bpf-dumps.tar.bz2"
+    agents:
+      - "queue=default"
+EOF
+  else
+    annotate --style info \
+      "Stable-BPF skipped as no relevant files were modified"
+  fi
+
   # Perf test suite
   if affects \
              .rs$ \
@@ -165,7 +192,7 @@ all_test_steps() {
     cat >> "$output_file" <<"EOF"
   - command: "ci/test-stable-perf.sh"
     name: "stable-perf"
-    timeout_in_minutes: 40
+    timeout_in_minutes: 20
     artifact_paths: "log-*.txt"
     agents:
       - "queue=cuda"
@@ -175,6 +202,30 @@ EOF
       "Stable-perf skipped as no relevant files were modified"
   fi
 
+  # Downstream backwards compatibility
+  if affects \
+             .rs$ \
+             Cargo.lock$ \
+             Cargo.toml$ \
+             ^ci/rust-version.sh \
+             ^ci/test-stable-perf.sh \
+             ^ci/test-stable.sh \
+             ^ci/test-local-cluster.sh \
+             ^core/build.rs \
+             ^fetch-perf-libs.sh \
+             ^programs/ \
+             ^sdk/ \
+             ^scripts/build-downstream-projects.sh \
+      ; then
+    cat >> "$output_file" <<"EOF"
+  - command: "scripts/build-downstream-projects.sh"
+    name: "downstream-projects"
+    timeout_in_minutes: 30
+EOF
+  else
+    annotate --style info \
+      "downstream-projects skipped as no relevant files were modified"
+  fi
   # Benches...
   if affects \
              .rs$ \
@@ -239,7 +290,7 @@ if [[ $BUILDKITE_BRANCH =~ ^pull ]]; then
   annotate --style info --context pr-backlink \
     "Github Pull Request: https://github.com/solana-labs/solana/$BUILDKITE_BRANCH"
 
-  if [[ $GITHUB_USER = "dependabot-preview[bot]" ]]; then
+  if [[ $GITHUB_USER = "dependabot[bot]" ]]; then
     command_step dependabot "ci/dependabot-pr.sh" 5
     wait_step
   fi

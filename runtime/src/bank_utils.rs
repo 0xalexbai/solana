@@ -3,7 +3,7 @@ use crate::{
     genesis_utils::{self, GenesisConfigInfo, ValidatorVoteKeypairs},
     vote_sender_types::ReplayVoteSender,
 };
-use solana_sdk::{pubkey::Pubkey, signature::Signer, transaction::Transaction};
+use solana_sdk::{pubkey::Pubkey, sanitized_transaction::SanitizedTransaction, signature::Signer};
 use solana_vote_program::vote_transaction;
 
 pub fn setup_bank_and_vote_pubkeys(num_vote_accounts: usize, stake: u64) -> (Bank, Vec<Pubkey>) {
@@ -27,21 +27,21 @@ pub fn setup_bank_and_vote_pubkeys(num_vote_accounts: usize, stake: u64) -> (Ban
 }
 
 pub fn find_and_send_votes(
-    txs: &[Transaction],
+    sanitized_txs: &[SanitizedTransaction],
     tx_results: &TransactionResults,
     vote_sender: Option<&ReplayVoteSender>,
 ) {
     let TransactionResults {
-        processing_results,
+        execution_results,
         overwritten_vote_accounts,
         ..
     } = tx_results;
     if let Some(vote_sender) = vote_sender {
         for old_account in overwritten_vote_accounts {
-            assert!(processing_results[old_account.transaction_result_index]
+            assert!(execution_results[old_account.transaction_result_index]
                 .0
                 .is_ok());
-            let transaction = &txs[old_account.transaction_index];
+            let transaction = &sanitized_txs[old_account.transaction_index];
             if let Some(parsed_vote) = vote_transaction::parse_vote_transaction(transaction) {
                 if parsed_vote.1.slots.last().is_some() {
                     let _ = vote_sender.send(parsed_vote);

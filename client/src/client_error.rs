@@ -1,9 +1,14 @@
-use crate::rpc_request;
-use solana_sdk::{
-    signature::SignerError, transaction::TransactionError, transport::TransportError,
+use {
+    crate::rpc_request,
+    solana_faucet::faucet::FaucetError,
+    solana_sdk::{
+        signature::SignerError, transaction::TransactionError, transport::TransportError,
+    },
+    std::io,
+    thiserror::Error,
 };
-use std::io;
-use thiserror::Error;
+
+pub use reqwest; // export `reqwest` for clients
 
 #[derive(Error, Debug)]
 pub enum ClientErrorKind {
@@ -19,6 +24,8 @@ pub enum ClientErrorKind {
     SigningError(#[from] SignerError),
     #[error(transparent)]
     TransactionError(#[from] TransactionError),
+    #[error(transparent)]
+    FaucetError(#[from] FaucetError),
     #[error("Custom: {0}")]
     Custom(String),
 }
@@ -33,16 +40,17 @@ impl From<TransportError> for ClientErrorKind {
     }
 }
 
-impl Into<TransportError> for ClientErrorKind {
-    fn into(self) -> TransportError {
-        match self {
-            Self::Io(err) => TransportError::IoError(err),
-            Self::TransactionError(err) => TransportError::TransactionError(err),
-            Self::Reqwest(err) => TransportError::Custom(format!("{:?}", err)),
-            Self::RpcError(err) => TransportError::Custom(format!("{:?}", err)),
-            Self::SerdeJson(err) => TransportError::Custom(format!("{:?}", err)),
-            Self::SigningError(err) => TransportError::Custom(format!("{:?}", err)),
-            Self::Custom(err) => TransportError::Custom(format!("{:?}", err)),
+impl From<ClientErrorKind> for TransportError {
+    fn from(client_error_kind: ClientErrorKind) -> Self {
+        match client_error_kind {
+            ClientErrorKind::Io(err) => Self::IoError(err),
+            ClientErrorKind::TransactionError(err) => Self::TransactionError(err),
+            ClientErrorKind::Reqwest(err) => Self::Custom(format!("{:?}", err)),
+            ClientErrorKind::RpcError(err) => Self::Custom(format!("{:?}", err)),
+            ClientErrorKind::SerdeJson(err) => Self::Custom(format!("{:?}", err)),
+            ClientErrorKind::SigningError(err) => Self::Custom(format!("{:?}", err)),
+            ClientErrorKind::FaucetError(err) => Self::Custom(format!("{:?}", err)),
+            ClientErrorKind::Custom(err) => Self::Custom(format!("{:?}", err)),
         }
     }
 }
@@ -50,10 +58,10 @@ impl Into<TransportError> for ClientErrorKind {
 #[derive(Error, Debug)]
 #[error("{kind}")]
 pub struct ClientError {
-    request: Option<rpc_request::RpcRequest>,
+    pub request: Option<rpc_request::RpcRequest>,
 
     #[source]
-    kind: ClientErrorKind,
+    pub kind: ClientErrorKind,
 }
 
 impl ClientError {
@@ -98,9 +106,9 @@ impl From<TransportError> for ClientError {
     }
 }
 
-impl Into<TransportError> for ClientError {
-    fn into(self) -> TransportError {
-        self.kind.into()
+impl From<ClientError> for TransportError {
+    fn from(client_error: ClientError) -> Self {
+        client_error.kind.into()
     }
 }
 
@@ -151,6 +159,15 @@ impl From<SignerError> for ClientError {
 
 impl From<TransactionError> for ClientError {
     fn from(err: TransactionError) -> Self {
+        Self {
+            request: None,
+            kind: err.into(),
+        }
+    }
+}
+
+impl From<FaucetError> for ClientError {
+    fn from(err: FaucetError) -> Self {
         Self {
             request: None,
             kind: err.into(),

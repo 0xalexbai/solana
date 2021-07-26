@@ -156,12 +156,12 @@ FLAGS:
 
 OPTIONS:
     -d, --data_dir <PATH>    Directory to store install data [default: .../Library/Application Support/solana]
-    -u, --url <URL>          JSON RPC URL for the solana cluster [default: http://devnet.solana.com]
+    -u, --url <URL>          JSON RPC URL for the solana cluster [default: http://api.devnet.solana.com]
     -p, --pubkey <PUBKEY>    Public key of the update manifest [default: 9XX329sPuskWhH4DQh6k16c87dHKhXLBZTL3Gxmve8Gp]
 ```
 
 ```text
-solana-install-info
+solana-install info
 displays information about the current installation
 
 USAGE:
@@ -173,7 +173,7 @@ FLAGS:
 ```
 
 ```text
-solana-install-deploy
+solana-install deploy
 deploys a new update
 
 USAGE:
@@ -188,7 +188,7 @@ ARGS:
 ```
 
 ```text
-solana-install-update
+solana-install update
 checks for an update, and if available downloads and applies it
 
 USAGE:
@@ -199,7 +199,7 @@ FLAGS:
 ```
 
 ```text
-solana-install-run
+solana-install run
 Runs a program while periodically checking and applying software updates
 
 USAGE:

@@ -1,57 +1,67 @@
-import React, { useState } from "react";
+import React from "react";
 import { Link } from "react-router-dom";
 import { PublicKey } from "@solana/web3.js";
 import { clusterPath } from "utils/url";
 import { displayAddress } from "utils/tx";
-import { Pubkey } from "solana-sdk-wasm";
 import { useCluster } from "providers/cluster";
+import { Copyable } from "./Copyable";
+import { useTokenRegistry } from "providers/mints/token-registry";
 
-type CopyState = "copy" | "copied";
 type Props = {
-  pubkey: PublicKey | Pubkey;
+  pubkey: PublicKey;
   alignRight?: boolean;
   link?: boolean;
   raw?: boolean;
   truncate?: boolean;
+  truncateUnknown?: boolean;
+  truncateChars?: number;
 };
 
-export function Address({ pubkey, alignRight, link, raw, truncate }: Props) {
-  const [state, setState] = useState<CopyState>("copy");
+export function Address({
+  pubkey,
+  alignRight,
+  link,
+  raw,
+  truncate,
+  truncateUnknown,
+  truncateChars,
+}: Props) {
   const address = pubkey.toBase58();
+  const { tokenRegistry } = useTokenRegistry();
   const { cluster } = useCluster();
 
-  const copyToClipboard = () => navigator.clipboard.writeText(address);
-  const handleClick = () =>
-    copyToClipboard().then(() => {
-      setState("copied");
-      setTimeout(() => setState("copy"), 1000);
-    });
+  if (
+    truncateUnknown &&
+    address === displayAddress(address, cluster, tokenRegistry)
+  ) {
+    truncate = true;
+  }
 
-  const copyIcon =
-    state === "copy" ? (
-      <span className="fe fe-copy" onClick={handleClick}></span>
-    ) : (
-      <span className="fe fe-check-circle"></span>
-    );
+  let addressLabel = raw
+    ? address
+    : displayAddress(address, cluster, tokenRegistry);
+
+  if (truncateChars && addressLabel === address) {
+    addressLabel = addressLabel.slice(0, truncateChars) + "…";
+  }
 
   const content = (
-    <>
-      <span className="c-pointer font-size-tiny mr-2">{copyIcon}</span>
+    <Copyable text={address} replaceText={!alignRight}>
       <span className="text-monospace">
         {link ? (
           <Link
             className={truncate ? "text-truncate address-truncate" : ""}
             to={clusterPath(`/address/${address}`)}
           >
-            {raw ? address : displayAddress(address, cluster)}
+            {addressLabel}
           </Link>
         ) : (
           <span className={truncate ? "text-truncate address-truncate" : ""}>
-            {raw ? address : displayAddress(address, cluster)}
+            {addressLabel}
           </span>
         )}
       </span>
-    </>
+    </Copyable>
   );
 
   return (

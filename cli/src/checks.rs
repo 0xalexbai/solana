@@ -55,11 +55,45 @@ pub fn check_account_for_multiple_fees_with_commitment(
     messages: &[&Message],
     commitment: CommitmentConfig,
 ) -> Result<(), CliError> {
+    check_account_for_spend_multiple_fees_with_commitment(
+        rpc_client,
+        account_pubkey,
+        0,
+        fee_calculator,
+        messages,
+        commitment,
+    )
+}
+
+pub fn check_account_for_spend_multiple_fees_with_commitment(
+    rpc_client: &RpcClient,
+    account_pubkey: &Pubkey,
+    balance: u64,
+    fee_calculator: &FeeCalculator,
+    messages: &[&Message],
+    commitment: CommitmentConfig,
+) -> Result<(), CliError> {
     let fee = calculate_fee(fee_calculator, messages);
-    if !check_account_for_balance_with_commitment(rpc_client, account_pubkey, fee, commitment)
-        .map_err(Into::<ClientError>::into)?
+    if !check_account_for_balance_with_commitment(
+        rpc_client,
+        account_pubkey,
+        balance + fee,
+        commitment,
+    )
+    .map_err(Into::<ClientError>::into)?
     {
-        return Err(CliError::InsufficientFundsForFee(lamports_to_sol(fee)));
+        if balance > 0 {
+            return Err(CliError::InsufficientFundsForSpendAndFee(
+                lamports_to_sol(balance),
+                lamports_to_sol(fee),
+                *account_pubkey,
+            ));
+        } else {
+            return Err(CliError::InsufficientFundsForFee(
+                lamports_to_sol(fee),
+                *account_pubkey,
+            ));
+        }
     }
     Ok(())
 }
@@ -131,7 +165,7 @@ mod tests {
             context: RpcResponseContext { slot: 1 },
             value: json!(account_balance),
         });
-        let pubkey = Pubkey::new_rand();
+        let pubkey = solana_sdk::pubkey::new_rand();
         let fee_calculator = FeeCalculator::new(1);
 
         let pubkey0 = Pubkey::new(&[0; 32]);
@@ -191,24 +225,15 @@ mod tests {
             context: RpcResponseContext { slot: 1 },
             value: json!(account_balance),
         });
-        let pubkey = Pubkey::new_rand();
+        let pubkey = solana_sdk::pubkey::new_rand();
 
         let mut mocks = HashMap::new();
         mocks.insert(RpcRequest::GetBalance, account_balance_response);
         let rpc_client = RpcClient::new_mock_with_mocks("".to_string(), mocks);
 
-        assert_eq!(
-            check_account_for_balance(&rpc_client, &pubkey, 1).unwrap(),
-            true
-        );
-        assert_eq!(
-            check_account_for_balance(&rpc_client, &pubkey, account_balance).unwrap(),
-            true
-        );
-        assert_eq!(
-            check_account_for_balance(&rpc_client, &pubkey, account_balance + 1).unwrap(),
-            false
-        );
+        assert!(check_account_for_balance(&rpc_client, &pubkey, 1).unwrap());
+        assert!(check_account_for_balance(&rpc_client, &pubkey, account_balance).unwrap());
+        assert!(!check_account_for_balance(&rpc_client, &pubkey, account_balance + 1).unwrap());
     }
 
     #[test]
@@ -237,9 +262,9 @@ mod tests {
 
     #[test]
     fn test_check_unique_pubkeys() {
-        let pubkey0 = Pubkey::new_rand();
+        let pubkey0 = solana_sdk::pubkey::new_rand();
         let pubkey_clone = pubkey0;
-        let pubkey1 = Pubkey::new_rand();
+        let pubkey1 = solana_sdk::pubkey::new_rand();
 
         check_unique_pubkeys((&pubkey0, "foo".to_string()), (&pubkey1, "bar".to_string()))
             .expect("unexpected result");

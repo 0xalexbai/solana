@@ -1,8 +1,9 @@
 import React from "react";
-import * as Sentry from "@sentry/react";
 import { clusterApiUrl, Connection } from "@solana/web3.js";
 import { useQuery } from "../utils/url";
 import { useHistory, useLocation } from "react-router-dom";
+import { reportError } from "utils/sentry";
+import { localStorageIsAvailable } from "utils";
 
 export enum ClusterStatus {
   Connected,
@@ -57,11 +58,11 @@ export const DEVNET_URL = clusterApiUrl("devnet");
 export function clusterUrl(cluster: Cluster, customUrl: string): string {
   switch (cluster) {
     case Cluster.Devnet:
-      return DEVNET_URL;
+      return DEVNET_URL.replace("api", "explorer-api");
     case Cluster.MainnetBeta:
-      return MAINNET_BETA_URL;
+      return MAINNET_BETA_URL.replace("api", "explorer-api");
     case Cluster.Testnet:
-      return TESTNET_URL;
+      return TESTNET_URL.replace("api", "explorer-api");
     case Cluster.Custom:
       return customUrl;
   }
@@ -134,22 +135,36 @@ export function ClusterProvider({ children }: ClusterProviderProps) {
   const [showModal, setShowModal] = React.useState(false);
   const query = useQuery();
   const cluster = parseQuery(query);
+  const enableCustomUrl =
+    localStorageIsAvailable() &&
+    localStorage.getItem("enableCustomUrl") !== null;
+  const customUrl = enableCustomUrl
+    ? query.get("customUrl") || ""
+    : state.customUrl;
   const history = useHistory();
   const location = useLocation();
+
+  // Remove customUrl param if dev setting is disabled
+  React.useEffect(() => {
+    if (!enableCustomUrl && query.has("customUrl")) {
+      query.delete("customUrl");
+      history.push({ ...location, search: query.toString() });
+    }
+  }, [enableCustomUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Reconnect to cluster when params change
   React.useEffect(() => {
     if (cluster === Cluster.Custom) {
       // Remove cluster param if custom url has not been set
-      if (state.customUrl.length === 0) {
+      if (customUrl.length === 0) {
         query.delete("cluster");
         history.push({ ...location, search: query.toString() });
         return;
       }
     }
 
-    updateCluster(dispatch, cluster, state.customUrl);
-  }, [cluster, state.customUrl]); // eslint-disable-line react-hooks/exhaustive-deps
+    updateCluster(dispatch, cluster, customUrl);
+  }, [cluster, customUrl]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <StateContext.Provider value={state}>
@@ -183,10 +198,14 @@ async function updateCluster(
       firstAvailableBlock,
     });
   } catch (error) {
-    Sentry.captureException(error, {
-      tags: { clusterUrl: clusterUrl(cluster, customUrl) },
+    if (cluster !== Cluster.Custom) {
+      reportError(error, { clusterUrl: clusterUrl(cluster, customUrl) });
+    }
+    dispatch({
+      status: ClusterStatus.Failure,
+      cluster,
+      customUrl,
     });
-    dispatch({ status: ClusterStatus.Failure, cluster, customUrl });
   }
 }
 

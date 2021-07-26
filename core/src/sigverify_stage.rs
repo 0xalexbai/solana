@@ -24,10 +24,10 @@ const RECV_BATCH_MAX_GPU: usize = 5_000;
 #[derive(Error, Debug)]
 pub enum SigVerifyServiceError {
     #[error("send packets batch error")]
-    SendError(#[from] SendError<Vec<Packets>>),
+    Send(#[from] SendError<Vec<Packets>>),
 
     #[error("streamer error")]
-    StreamerError(#[from] StreamerError),
+    Streamer(#[from] StreamerError),
 }
 
 type Result<T> = std::result::Result<T, SigVerifyServiceError>;
@@ -45,8 +45,7 @@ pub struct DisabledSigVerifier {}
 
 impl SigVerifier for DisabledSigVerifier {
     fn verify_batch(&self, mut batch: Vec<Packets>) -> Vec<Packets> {
-        let r = sigverify::ed25519_verify_disabled(&batch);
-        sigverify::mark_disabled(&mut batch, &r);
+        sigverify::ed25519_verify_disabled(&mut batch);
         batch
     }
 }
@@ -85,13 +84,7 @@ impl SigVerifyStage {
             len,
             id
         );
-
-        let verified_batch = verifier.verify_batch(batch);
-
-        for v in verified_batch {
-            sendr.send(vec![v])?;
-        }
-
+        sendr.send(verifier.verify_batch(batch))?;
         verify_batch_time.stop();
 
         debug!(
@@ -127,13 +120,13 @@ impl SigVerifyStage {
             .spawn(move || loop {
                 if let Err(e) = Self::verifier(&packet_receiver, &verified_sender, id, &verifier) {
                     match e {
-                        SigVerifyServiceError::StreamerError(StreamerError::RecvTimeoutError(
+                        SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(
                             RecvTimeoutError::Disconnected,
                         )) => break,
-                        SigVerifyServiceError::StreamerError(StreamerError::RecvTimeoutError(
+                        SigVerifyServiceError::Streamer(StreamerError::RecvTimeout(
                             RecvTimeoutError::Timeout,
                         )) => (),
-                        SigVerifyServiceError::SendError(_) => {
+                        SigVerifyServiceError::Send(_) => {
                             break;
                         }
                         _ => error!("{:?}", e),

@@ -1,15 +1,18 @@
 //! The `packet` module defines data structures and methods to pull data from the network.
-use crate::recvmmsg::{recv_mmsg, NUM_RCVMMSGS};
+use crate::{
+    recvmmsg::{recv_mmsg, NUM_RCVMMSGS},
+    socket::SocketAddrSpace,
+};
 pub use solana_perf::packet::{
-    limited_deserialize, to_packets, to_packets_chunked, Packets, PacketsRecycler, NUM_PACKETS,
-    PACKETS_BATCH_SIZE, PACKETS_PER_BATCH,
+    limited_deserialize, to_packets_chunked, Packets, PacketsRecycler, NUM_PACKETS,
+    PACKETS_PER_BATCH,
 };
 
 use solana_metrics::inc_new_counter_debug;
 pub use solana_sdk::packet::{Meta, Packet, PACKET_DATA_SIZE};
 use std::{io::Result, net::UdpSocket, time::Instant};
 
-pub fn recv_from(obj: &mut Packets, socket: &UdpSocket, max_wait_ms: usize) -> Result<usize> {
+pub fn recv_from(obj: &mut Packets, socket: &UdpSocket, max_wait_ms: u64) -> Result<usize> {
     let mut i = 0;
     //DOCUMENTED SIDE-EFFECT
     //Performance out of the IO without poll
@@ -27,7 +30,7 @@ pub fn recv_from(obj: &mut Packets, socket: &UdpSocket, max_wait_ms: usize) -> R
         );
         match recv_mmsg(socket, &mut obj.packets[i..]) {
             Err(_) if i > 0 => {
-                if start.elapsed().as_millis() > 1 {
+                if start.elapsed().as_millis() as u64 > max_wait_ms {
                     break;
                 }
             }
@@ -43,7 +46,7 @@ pub fn recv_from(obj: &mut Packets, socket: &UdpSocket, max_wait_ms: usize) -> R
                 i += npkts;
                 // Try to batch into big enough buffers
                 // will cause less re-shuffling later on.
-                if start.elapsed().as_millis() > max_wait_ms as u128 || i >= PACKETS_PER_BATCH {
+                if start.elapsed().as_millis() as u64 > max_wait_ms || i >= PACKETS_PER_BATCH {
                     break;
                 }
             }
@@ -54,10 +57,16 @@ pub fn recv_from(obj: &mut Packets, socket: &UdpSocket, max_wait_ms: usize) -> R
     Ok(i)
 }
 
-pub fn send_to(obj: &Packets, socket: &UdpSocket) -> Result<()> {
+pub fn send_to(
+    obj: &Packets,
+    socket: &UdpSocket,
+    socket_addr_space: &SocketAddrSpace,
+) -> Result<()> {
     for p in &obj.packets {
-        let a = p.meta.addr();
-        socket.send_to(&p.data[..p.meta.size], &a)?;
+        let addr = p.meta.addr();
+        if socket_addr_space.check(&addr) {
+            socket.send_to(&p.data[..p.meta.size], &addr)?;
+        }
     }
     Ok(())
 }
@@ -94,7 +103,7 @@ mod tests {
             m.meta.set_addr(&addr);
             m.meta.size = PACKET_DATA_SIZE;
         }
-        send_to(&p, &send_socket).unwrap();
+        send_to(&p, &send_socket, &SocketAddrSpace::Unspecified).unwrap();
 
         let recvd = recv_from(&mut p, &recv_socket, 1).unwrap();
 
@@ -147,7 +156,7 @@ mod tests {
                 m.meta.set_addr(&addr);
                 m.meta.size = 1;
             }
-            send_to(&p, &send_socket).unwrap();
+            send_to(&p, &send_socket, &SocketAddrSpace::Unspecified).unwrap();
         }
 
         let recvd = recv_from(&mut p, &recv_socket, 100).unwrap();

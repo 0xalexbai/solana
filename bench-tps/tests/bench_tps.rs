@@ -1,27 +1,42 @@
-use serial_test_derive::serial;
-use solana_bench_tps::bench::{do_bench_tps, generate_and_fund_keypairs};
-use solana_bench_tps::cli::Config;
+#![allow(clippy::integer_arithmetic)]
+use serial_test::serial;
+use solana_bench_tps::{
+    bench::{do_bench_tps, generate_and_fund_keypairs},
+    cli::Config,
+};
 use solana_client::thin_client::create_client;
-use solana_core::cluster_info::VALIDATOR_PORT_RANGE;
 use solana_core::validator::ValidatorConfig;
-use solana_faucet::faucet::run_local_faucet;
-use solana_local_cluster::local_cluster::{ClusterConfig, LocalCluster};
+use solana_faucet::faucet::run_local_faucet_with_port;
+use solana_gossip::cluster_info::VALIDATOR_PORT_RANGE;
+use solana_local_cluster::{
+    local_cluster::{ClusterConfig, LocalCluster},
+    validator_configs::make_identical_validator_configs,
+};
 use solana_sdk::signature::{Keypair, Signer};
-use std::sync::{mpsc::channel, Arc};
-use std::time::Duration;
+use solana_streamer::socket::SocketAddrSpace;
+use std::{
+    sync::{mpsc::channel, Arc},
+    time::Duration,
+};
 
 fn test_bench_tps_local_cluster(config: Config) {
     let native_instruction_processors = vec![];
 
     solana_logger::setup();
     const NUM_NODES: usize = 1;
-    let cluster = LocalCluster::new(&ClusterConfig {
-        node_stakes: vec![999_990; NUM_NODES],
-        cluster_lamports: 200_000_000,
-        validator_configs: vec![ValidatorConfig::default(); NUM_NODES],
-        native_instruction_processors,
-        ..ClusterConfig::default()
-    });
+    let cluster = LocalCluster::new(
+        &mut ClusterConfig {
+            node_stakes: vec![999_990; NUM_NODES],
+            cluster_lamports: 200_000_000,
+            validator_configs: make_identical_validator_configs(
+                &ValidatorConfig::default(),
+                NUM_NODES,
+            ),
+            native_instruction_processors,
+            ..ClusterConfig::default()
+        },
+        SocketAddrSpace::Unspecified,
+    );
 
     let faucet_keypair = Keypair::new();
     cluster.transfer(
@@ -36,8 +51,11 @@ fn test_bench_tps_local_cluster(config: Config) {
     ));
 
     let (addr_sender, addr_receiver) = channel();
-    run_local_faucet(faucet_keypair, addr_sender, None);
-    let faucet_addr = addr_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+    run_local_faucet_with_port(faucet_keypair, addr_sender, None, 0);
+    let faucet_addr = addr_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("run_local_faucet")
+        .expect("faucet_addr");
 
     let lamports_per_account = 100;
 
@@ -60,9 +78,9 @@ fn test_bench_tps_local_cluster(config: Config) {
 #[test]
 #[serial]
 fn test_bench_tps_local_cluster_solana() {
-    let mut config = Config::default();
-    config.tx_count = 100;
-    config.duration = Duration::from_secs(10);
-
-    test_bench_tps_local_cluster(config);
+    test_bench_tps_local_cluster(Config {
+        tx_count: 100,
+        duration: Duration::from_secs(10),
+        ..Config::default()
+    });
 }

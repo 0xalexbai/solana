@@ -12,8 +12,8 @@ struct HashAge {
 }
 
 /// Low memory overhead, so can be cloned for every checkpoint
-#[frozen_abi(digest = "EwaoLA34VN18E95GvjmkeStUpWqTeBd7FGpd7mppLmEw")]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, AbiExample)]
+#[frozen_abi(digest = "J1fGiMHyiKEBcWE6mfm7grAEGJgYEaVLzcrNZvd37iA2")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, AbiExample)]
 pub struct BlockhashQueue {
     /// updated whenever an hash is registered
     hash_height: u64,
@@ -127,7 +127,7 @@ impl BlockhashQueue {
             .map(|(k, v)| recent_blockhashes::IterItem(v.hash_height, k, &v.fee_calculator))
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.max_age
     }
 }

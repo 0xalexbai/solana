@@ -1,16 +1,18 @@
 /// A module for managing a Google API access token
-use goauth::{
-    auth::{JwtClaims, Token},
-    credentials::Credentials,
-};
-use log::*;
-use smpl_jwt::Jwt;
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        {Arc, RwLock},
+use {
+    goauth::{
+        auth::{JwtClaims, Token},
+        credentials::Credentials,
     },
-    time::Instant,
+    log::*,
+    smpl_jwt::Jwt,
+    std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            {Arc, RwLock},
+        },
+        time::Instant,
+    },
 };
 
 pub use goauth::scopes::Scope;
@@ -89,6 +91,7 @@ impl AccessToken {
                 return;
             }
 
+            #[allow(deprecated)]
             if self
                 .refresh_active
                 .compare_and_swap(false, true, Ordering::Relaxed)

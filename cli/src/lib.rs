@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 macro_rules! ACCOUNT_STRING {
     () => {
         r#", one of:
@@ -9,7 +10,6 @@ macro_rules! ACCOUNT_STRING {
     };
 }
 
-#[macro_use]
 macro_rules! pubkey {
     ($arg:expr, $help:expr) => {
         $arg.takes_value(true)
@@ -19,15 +19,18 @@ macro_rules! pubkey {
 }
 
 #[macro_use]
+extern crate const_format;
+
 extern crate serde_derive;
 
 pub mod checks;
 pub mod cli;
-pub mod cli_output;
 pub mod cluster_query;
-pub mod display;
+pub mod feature;
+pub mod inflation;
+pub mod memo;
 pub mod nonce;
-pub mod offline;
+pub mod program;
 pub mod spend_utils;
 pub mod stake;
 pub mod test_utils;

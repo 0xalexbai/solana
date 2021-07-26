@@ -1,7 +1,10 @@
 //! The `genesis_config` module is a library for generating the chain's genesis config.
 
+#![cfg(feature = "full")]
+
 use crate::{
     account::Account,
+    account::AccountSharedData,
     clock::{UnixTimestamp, DEFAULT_TICKS_PER_SLOT},
     epoch_schedule::EpochSchedule,
     fee_calculator::FeeRateGovernor,
@@ -18,27 +21,52 @@ use crate::{
 };
 use bincode::{deserialize, serialize};
 use chrono::{TimeZone, Utc};
-use memmap::Mmap;
+use memmap2::Mmap;
 use std::{
     collections::BTreeMap,
     fmt,
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+pub const DEFAULT_GENESIS_FILE: &str = "genesis.bin";
+pub const DEFAULT_GENESIS_ARCHIVE: &str = "genesis.tar.bz2";
+pub const DEFAULT_GENESIS_DOWNLOAD_PATH: &str = "/genesis.tar.bz2";
 
 // deprecated default that is no longer used
 pub const UNUSED_DEFAULT: u64 = 1024;
 
+// The order can't align with release lifecycle only to remain ABI-compatible...
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, AbiEnumVisitor, AbiExample)]
-pub enum OperatingMode {
-    Preview,     // Next set of cluster features to be promoted to Stable
-    Stable,      // Stable cluster features
-    Development, // All features (including experimental features)
+pub enum ClusterType {
+    Testnet,
+    MainnetBeta,
+    Devnet,
+    Development,
 }
 
-#[frozen_abi(digest = "2KQs7m2DbLxkEx6pY9Z6qwYJAhN2Q4AdoNgUcULmscgB")]
+impl ClusterType {
+    pub const STRINGS: [&'static str; 4] = ["development", "devnet", "testnet", "mainnet-beta"];
+}
+
+impl FromStr for ClusterType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "development" => Ok(ClusterType::Development),
+            "devnet" => Ok(ClusterType::Devnet),
+            "testnet" => Ok(ClusterType::Testnet),
+            "mainnet-beta" => Ok(ClusterType::MainnetBeta),
+            _ => Err(format!("{} is unrecognized for cluster type", s)),
+        }
+    }
+}
+
+#[frozen_abi(digest = "3V3ZVRyzNhRfe8RJwDeGpeTP8xBWGGFBEbwTkvKKVjEa")]
 #[derive(Serialize, Deserialize, Debug, Clone, AbiExample)]
 pub struct GenesisConfig {
     /// when the network (bootstrap validator) was started relative to the UNIX Epoch
@@ -65,7 +93,7 @@ pub struct GenesisConfig {
     /// how slots map to epochs
     pub epoch_schedule: EpochSchedule,
     /// network runlevel
-    pub operating_mode: OperatingMode,
+    pub cluster_type: ClusterType,
 }
 
 // useful for basic tests
@@ -75,7 +103,7 @@ pub fn create_genesis_config(lamports: u64) -> (GenesisConfig, Keypair) {
         GenesisConfig::new(
             &[(
                 faucet_keypair.pubkey(),
-                Account::new(lamports, 0, &system_program::id()),
+                AccountSharedData::new(lamports, 0, &system_program::id()),
             )],
             &[],
         ),
@@ -101,20 +129,21 @@ impl Default for GenesisConfig {
             fee_rate_governor: FeeRateGovernor::default(),
             rent: Rent::default(),
             epoch_schedule: EpochSchedule::default(),
-            operating_mode: OperatingMode::Development,
+            cluster_type: ClusterType::Development,
         }
     }
 }
 
 impl GenesisConfig {
     pub fn new(
-        accounts: &[(Pubkey, Account)],
+        accounts: &[(Pubkey, AccountSharedData)],
         native_instruction_processors: &[(String, Pubkey)],
     ) -> Self {
         Self {
             accounts: accounts
                 .iter()
                 .cloned()
+                .map(|(key, account)| (key, Account::from(account)))
                 .collect::<BTreeMap<Pubkey, Account>>(),
             native_instruction_processors: native_instruction_processors.to_vec(),
             ..GenesisConfig::default()
@@ -127,11 +156,11 @@ impl GenesisConfig {
     }
 
     fn genesis_filename(ledger_path: &Path) -> PathBuf {
-        Path::new(ledger_path).join("genesis.bin")
+        Path::new(ledger_path).join(DEFAULT_GENESIS_FILE)
     }
 
     pub fn load(ledger_path: &Path) -> Result<Self, std::io::Error> {
-        let filename = Self::genesis_filename(&ledger_path);
+        let filename = Self::genesis_filename(ledger_path);
         let file = OpenOptions::new()
             .read(true)
             .open(&filename)
@@ -169,20 +198,16 @@ impl GenesisConfig {
 
         std::fs::create_dir_all(&ledger_path)?;
 
-        let mut file = File::create(Self::genesis_filename(&ledger_path))?;
+        let mut file = File::create(Self::genesis_filename(ledger_path))?;
         file.write_all(&serialized)
     }
 
-    pub fn add_account(&mut self, pubkey: Pubkey, account: Account) {
-        self.accounts.insert(pubkey, account);
+    pub fn add_account(&mut self, pubkey: Pubkey, account: AccountSharedData) {
+        self.accounts.insert(pubkey, Account::from(account));
     }
 
     pub fn add_native_instruction_processor(&mut self, name: String, program_id: Pubkey) {
         self.native_instruction_processors.push((name, program_id));
-    }
-
-    pub fn add_rewards_pool(&mut self, pubkey: Pubkey, account: Account) {
-        self.rewards_pools.insert(pubkey, account);
     }
 
     pub fn hashes_per_tick(&self) -> Option<u64> {
@@ -194,7 +219,10 @@ impl GenesisConfig {
     }
 
     pub fn ns_per_slot(&self) -> u128 {
-        self.poh_config.target_tick_duration.as_nanos() * self.ticks_per_slot() as u128
+        self.poh_config
+            .target_tick_duration
+            .as_nanos()
+            .saturating_mul(self.ticks_per_slot() as u128)
     }
 
     pub fn slots_per_year(&self) -> f64 {
@@ -212,30 +240,36 @@ impl fmt::Display for GenesisConfig {
             f,
             "\
              Creation time: {}\n\
-             Operating mode: {:?}\n\
+             Cluster type: {:?}\n\
              Genesis hash: {}\n\
              Shred version: {}\n\
              Ticks per slot: {:?}\n\
              Hashes per tick: {:?}\n\
+             Target tick duration: {:?}\n\
              Slots per epoch: {}\n\
              Warmup epochs: {}abled\n\
+             Slots per year: {}\n\
              {:?}\n\
              {:?}\n\
              {:?}\n\
              Capitalization: {} SOL in {} accounts\n\
+             Native instruction processors: {:#?}\n\
+             Rewards pool: {:#?}\n\
              ",
             Utc.timestamp(self.creation_time, 0).to_rfc3339(),
-            self.operating_mode,
+            self.cluster_type,
             self.hash(),
             compute_shred_version(&self.hash(), None),
             self.ticks_per_slot,
             self.poh_config.hashes_per_tick,
+            self.poh_config.target_tick_duration,
             self.epoch_schedule.slots_per_epoch,
             if self.epoch_schedule.warmup {
                 "en"
             } else {
                 "dis"
             },
+            self.slots_per_year(),
             self.inflation,
             self.rent,
             self.fee_rate_governor,
@@ -251,6 +285,8 @@ impl fmt::Display for GenesisConfig {
                     .sum::<u64>()
             ),
             self.accounts.len(),
+            self.native_instruction_processors,
+            self.rewards_pools,
         )
     }
 }
@@ -287,10 +323,13 @@ mod tests {
         let mut config = GenesisConfig::default();
         config.add_account(
             faucet_keypair.pubkey(),
-            Account::new(10_000, 0, &Pubkey::default()),
+            AccountSharedData::new(10_000, 0, &Pubkey::default()),
         );
-        config.add_account(Pubkey::new_rand(), Account::new(1, 0, &Pubkey::default()));
-        config.add_native_instruction_processor("hi".to_string(), Pubkey::new_rand());
+        config.add_account(
+            solana_sdk::pubkey::new_rand(),
+            AccountSharedData::new(1, 0, &Pubkey::default()),
+        );
+        config.add_native_instruction_processor("hi".to_string(), solana_sdk::pubkey::new_rand());
 
         assert_eq!(config.accounts.len(), 2);
         assert!(config
@@ -300,8 +339,8 @@ mod tests {
                 && account.lamports == 10_000));
 
         let path = &make_tmp_path("genesis_config");
-        config.write(&path).expect("write");
-        let loaded_config = GenesisConfig::load(&path).expect("load");
+        config.write(path).expect("write");
+        let loaded_config = GenesisConfig::load(path).expect("load");
         assert_eq!(config.hash(), loaded_config.hash());
         let _ignored = std::fs::remove_file(&path);
     }

@@ -1,3 +1,4 @@
+#![allow(clippy::integer_arithmetic)]
 #![feature(test)]
 
 extern crate test;
@@ -6,21 +7,23 @@ use crossbeam_channel::unbounded;
 use log::*;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
-use solana_core::banking_stage::{create_test_recorder, BankingStage};
-use solana_core::cluster_info::ClusterInfo;
-use solana_core::cluster_info::Node;
-use solana_core::poh_recorder::WorkingBankEntry;
+use solana_core::banking_stage::{BankingStage, BankingStageStats};
+use solana_core::cost_model::CostModel;
+use solana_core::cost_tracker::CostTracker;
+use solana_entry::entry::{next_hash, Entry};
+use solana_gossip::cluster_info::ClusterInfo;
+use solana_gossip::cluster_info::Node;
 use solana_ledger::blockstore_processor::process_entries;
-use solana_ledger::entry::{next_hash, Entry};
 use solana_ledger::genesis_utils::{create_genesis_config, GenesisConfigInfo};
 use solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path};
 use solana_perf::packet::to_packets_chunked;
 use solana_perf::test_tx::test_tx;
+use solana_poh::poh_recorder::{create_test_recorder, WorkingBankEntry};
 use solana_runtime::bank::Bank;
 use solana_sdk::genesis_config::GenesisConfig;
 use solana_sdk::hash::Hash;
 use solana_sdk::message::Message;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signature::Signature;
 use solana_sdk::signature::Signer;
@@ -28,9 +31,11 @@ use solana_sdk::system_instruction;
 use solana_sdk::system_transaction;
 use solana_sdk::timing::{duration_as_us, timestamp};
 use solana_sdk::transaction::Transaction;
+use solana_streamer::socket::SocketAddrSpace;
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use test::Bencher;
 
@@ -56,7 +61,7 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(100_000);
     let bank = Arc::new(Bank::new(&genesis_config));
     let ledger_path = get_tmp_ledger_path!();
-    let my_pubkey = Pubkey::new_rand();
+    let my_pubkey = pubkey::new_rand();
     {
         let blockstore = Arc::new(
             Blockstore::open(&ledger_path).expect("Expected to be able to open database ledger"),
@@ -64,14 +69,16 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
         let (exit, poh_recorder, poh_service, _signal_receiver) =
             create_test_recorder(&bank, &blockstore, None);
 
+        let recorder = poh_recorder.lock().unwrap().recorder();
+
         let tx = test_tx();
         let len = 4096;
         let chunk_size = 1024;
         let batches = to_packets_chunked(&vec![tx; len], chunk_size);
-        let mut packets = vec![];
+        let mut packets = VecDeque::new();
         for batch in batches {
             let batch_len = batch.packets.len();
-            packets.push((batch, vec![0usize; batch_len]));
+            packets.push_back((batch, vec![0usize; batch_len], false));
         }
         let (s, _r) = unbounded();
         // This tests the performance of buffering packets.
@@ -79,11 +86,17 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
         bencher.iter(move || {
             let _ignored = BankingStage::consume_buffered_packets(
                 &my_pubkey,
+                std::u128::MAX,
                 &poh_recorder,
                 &mut packets,
-                10_000,
                 None,
                 &s,
+                None::<Box<dyn Fn()>>,
+                &BankingStageStats::default(),
+                &recorder,
+                &Arc::new(RwLock::new(CostTracker::new(Arc::new(RwLock::new(
+                    CostModel::new(std::u64::MAX, std::u64::MAX),
+                ))))),
             );
         });
 
@@ -94,15 +107,15 @@ fn bench_consume_buffered(bencher: &mut Bencher) {
 }
 
 fn make_accounts_txs(txes: usize, mint_keypair: &Keypair, hash: Hash) -> Vec<Transaction> {
-    let to_pubkey = Pubkey::new_rand();
+    let to_pubkey = pubkey::new_rand();
     let dummy = system_transaction::transfer(mint_keypair, &to_pubkey, 1, hash);
     (0..txes)
         .into_par_iter()
         .map(|_| {
             let mut new = dummy.clone();
             let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
-            new.message.account_keys[0] = Pubkey::new_rand();
-            new.message.account_keys[1] = Pubkey::new_rand();
+            new.message.account_keys[0] = pubkey::new_rand();
+            new.message.account_keys[1] = pubkey::new_rand();
             new.signatures = vec![Signature::new(&sig[0..64])];
             new
         })
@@ -117,7 +130,7 @@ fn make_programs_txs(txes: usize, hash: Hash) -> Vec<Transaction> {
             let mut instructions = vec![];
             let from_key = Keypair::new();
             for _ in 1..progs {
-                let to_key = Pubkey::new_rand();
+                let to_key = pubkey::new_rand();
                 instructions.push(system_instruction::transfer(&from_key.pubkey(), &to_key, 1));
             }
             let message = Message::new(&instructions, Some(&from_key.pubkey()));
@@ -151,6 +164,9 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
 
     let (verified_sender, verified_receiver) = unbounded();
     let (vote_sender, vote_receiver) = unbounded();
+    let mut bank = Bank::new(&genesis_config);
+    // Allow arbitrary transaction processing time for the purposes of this bench
+    bank.ns_per_slot = std::u128::MAX;
     let bank = Arc::new(Bank::new(&genesis_config));
 
     debug!("threads: {} txs: {}", num_threads, txes);
@@ -173,12 +189,12 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
     });
     //sanity check, make sure all the transactions can execute sequentially
     transactions.iter().for_each(|tx| {
-        let res = bank.process_transaction(&tx);
+        let res = bank.process_transaction(tx);
         assert!(res.is_ok(), "sanity test transactions");
     });
     bank.clear_signatures();
     //sanity check, make sure all the transactions can execute in parallel
-    let res = bank.process_transactions(&transactions);
+    let res = bank.process_transactions(transactions.iter());
     for r in res {
         assert!(r.is_ok(), "sanity parallel execution");
     }
@@ -191,7 +207,11 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
         );
         let (exit, poh_recorder, poh_service, signal_receiver) =
             create_test_recorder(&bank, &blockstore, None);
-        let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
+        let cluster_info = ClusterInfo::new(
+            Node::new_localhost().info,
+            Arc::new(Keypair::new()),
+            SocketAddrSpace::Unspecified,
+        );
         let cluster_info = Arc::new(cluster_info);
         let (s, _r) = unbounded();
         let _banking_stage = BankingStage::new(
@@ -201,6 +221,9 @@ fn bench_banking(bencher: &mut Bencher, tx_type: TransactionType) {
             vote_receiver,
             None,
             s,
+            Arc::new(RwLock::new(CostTracker::new(Arc::new(RwLock::new(
+                CostModel::new(std::u64::MAX, std::u64::MAX),
+            ))))),
         );
         poh_recorder.lock().unwrap().set_bank(&bank);
 
@@ -292,7 +315,7 @@ fn simulate_process_entries(
         hash: next_hash(&bank.last_blockhash(), 1, &tx_vector),
         transactions: tx_vector,
     };
-    process_entries(&bank, &[entry], randomize_txs, None, None).unwrap();
+    process_entries(&bank, &mut [entry], randomize_txs, None, None).unwrap();
 }
 
 #[allow(clippy::same_item_push)]

@@ -1,155 +1,106 @@
 use crate::{
-    bank::{Builtin, Entrypoint},
+    bank::{Builtin, Builtins},
     system_instruction_processor,
 };
 use solana_sdk::{
-    clock::{Epoch, GENESIS_EPOCH},
-    genesis_config::OperatingMode,
-    system_program,
+    feature_set,
+    instruction::InstructionError,
+    process_instruction::{stable_log, InvokeContext, ProcessInstructionWithContext},
+    pubkey::Pubkey,
+    stake, system_program,
 };
 
-use log::*;
+fn process_instruction_with_program_logging(
+    process_instruction: ProcessInstructionWithContext,
+    program_id: &Pubkey,
+    instruction_data: &[u8],
+    invoke_context: &mut dyn InvokeContext,
+) -> Result<(), InstructionError> {
+    let logger = invoke_context.get_logger();
+    stable_log::program_invoke(&logger, program_id, invoke_context.invoke_depth());
 
-/// The entire set of available builtin programs that should be active at the given operating_mode
-pub fn get_builtins(operating_mode: OperatingMode) -> Vec<(Builtin, Epoch)> {
-    trace!("get_builtins: {:?}", operating_mode);
-    let mut builtins = vec![];
+    let result = process_instruction(program_id, instruction_data, invoke_context);
 
-    builtins.extend(
-        vec![
-            Builtin::new(
-                "system_program",
-                system_program::id(),
-                Entrypoint::Program(system_instruction_processor::process_instruction),
-            ),
-            Builtin::new(
-                "config_program",
-                solana_config_program::id(),
-                Entrypoint::Program(solana_config_program::config_processor::process_instruction),
-            ),
-            Builtin::new(
-                "stake_program",
-                solana_stake_program::id(),
-                Entrypoint::Program(solana_stake_program::stake_instruction::process_instruction),
-            ),
-            Builtin::new(
-                "vote_program",
-                solana_vote_program::id(),
-                Entrypoint::Program(solana_vote_program::vote_instruction::process_instruction),
-            ),
-        ]
-        .into_iter()
-        .map(|program| (program, GENESIS_EPOCH))
-        .collect::<Vec<_>>(),
-    );
-
-    // repurpose Preview for test_get_builtins because the Development is overloaded...
-    #[cfg(test)]
-    if operating_mode == OperatingMode::Preview {
-        use solana_sdk::instruction::InstructionError;
-        use solana_sdk::{account::KeyedAccount, pubkey::Pubkey};
-        use std::str::FromStr;
-        fn mock_ix_processor(
-            _pubkey: &Pubkey,
-            _ka: &[KeyedAccount],
-            _data: &[u8],
-        ) -> std::result::Result<(), InstructionError> {
-            Err(InstructionError::Custom(42))
-        }
-        let program_id = Pubkey::from_str("7saCc6X5a2syoYANA5oUUnPZLcLMfKoSjiDhFU5fbpoK").unwrap();
-        builtins.extend(vec![(
-            Builtin::new("mock", program_id, Entrypoint::Program(mock_ix_processor)),
-            2,
-        )]);
+    match &result {
+        Ok(()) => stable_log::program_success(&logger, program_id),
+        Err(err) => stable_log::program_failure(&logger, program_id, err),
     }
-
-    builtins
+    result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::bank::Bank;
-    use solana_sdk::{
-        genesis_config::{create_genesis_config, OperatingMode},
-        pubkey::Pubkey,
+macro_rules! with_program_logging {
+    ($process_instruction:expr) => {
+        |program_id: &Pubkey, instruction_data: &[u8], invoke_context: &mut dyn InvokeContext| {
+            process_instruction_with_program_logging(
+                $process_instruction,
+                program_id,
+                instruction_data,
+                invoke_context,
+            )
+        }
     };
+}
 
-    use std::str::FromStr;
-    use std::sync::Arc;
+/// Builtin programs that are always available
+fn genesis_builtins() -> Vec<Builtin> {
+    vec![
+        Builtin::new(
+            "system_program",
+            system_program::id(),
+            with_program_logging!(system_instruction_processor::process_instruction),
+        ),
+        Builtin::new(
+            "vote_program",
+            solana_vote_program::id(),
+            with_program_logging!(solana_vote_program::vote_instruction::process_instruction),
+        ),
+        Builtin::new(
+            "stake_program",
+            stake::program::id(),
+            with_program_logging!(solana_stake_program::stake_instruction::process_instruction),
+        ),
+        Builtin::new(
+            "config_program",
+            solana_config_program::id(),
+            with_program_logging!(solana_config_program::config_processor::process_instruction),
+        ),
+        Builtin::new(
+            "secp256k1_program",
+            solana_sdk::secp256k1_program::id(),
+            solana_secp256k1_program::process_instruction,
+        ),
+    ]
+}
 
-    #[test]
-    fn test_get_builtins() {
-        let (mut genesis_config, _mint_keypair) = create_genesis_config(100_000);
-        genesis_config.operating_mode = OperatingMode::Preview;
-        let bank0 = Arc::new(Bank::new(&genesis_config));
+#[derive(AbiExample, Debug, Clone)]
+pub enum ActivationType {
+    NewProgram,
+    NewVersion,
+}
 
-        let restored_slot1 = genesis_config.epoch_schedule.get_first_slot_in_epoch(2);
-        let bank1 = Arc::new(Bank::new_from_parent(
-            &bank0,
-            &Pubkey::default(),
-            restored_slot1,
-        ));
+/// Builtin programs activated dynamically by feature
+///
+/// Note: If the feature_builtin is intended to replace another builtin program, it must have a new
+/// name.
+/// This is to enable the runtime to determine categorically whether the builtin update has
+/// occurred, and preserve idempotency in Bank::add_native_program across genesis, snapshot, and
+/// normal child Bank creation.
+/// https://github.com/solana-labs/solana/blob/84b139cc94b5be7c9e0c18c2ad91743231b85a0d/runtime/src/bank.rs#L1723
+fn feature_builtins() -> Vec<(Builtin, Pubkey, ActivationType)> {
+    vec![(
+        Builtin::new(
+            "compute_budget_program",
+            solana_sdk::compute_budget::id(),
+            solana_compute_budget_program::process_instruction,
+        ),
+        feature_set::tx_wide_compute_cap::id(),
+        ActivationType::NewProgram,
+    )]
+}
 
-        let restored_slot2 = genesis_config.epoch_schedule.get_first_slot_in_epoch(3);
-        let bank2 = Arc::new(Bank::new_from_parent(
-            &bank1,
-            &Pubkey::default(),
-            restored_slot2,
-        ));
-
-        let warped_slot = genesis_config.epoch_schedule.get_first_slot_in_epoch(999);
-        let warped_bank = Arc::new(Bank::warp_from_parent(
-            &bank0,
-            &Pubkey::default(),
-            warped_slot,
-        ));
-
-        assert_eq!(bank0.slot(), 0);
-        assert_eq!(
-            bank0.builtin_program_ids(),
-            vec![
-                system_program::id(),
-                solana_config_program::id(),
-                solana_stake_program::id(),
-                solana_vote_program::id(),
-            ]
-        );
-
-        assert_eq!(bank1.slot(), restored_slot1);
-        assert_eq!(
-            bank1.builtin_program_ids(),
-            vec![
-                system_program::id(),
-                solana_config_program::id(),
-                solana_stake_program::id(),
-                solana_vote_program::id(),
-                Pubkey::from_str("7saCc6X5a2syoYANA5oUUnPZLcLMfKoSjiDhFU5fbpoK").unwrap(),
-            ]
-        );
-
-        assert_eq!(bank2.slot(), restored_slot2);
-        assert_eq!(
-            bank2.builtin_program_ids(),
-            vec![
-                system_program::id(),
-                solana_config_program::id(),
-                solana_stake_program::id(),
-                solana_vote_program::id(),
-                Pubkey::from_str("7saCc6X5a2syoYANA5oUUnPZLcLMfKoSjiDhFU5fbpoK").unwrap(),
-            ]
-        );
-
-        assert_eq!(warped_bank.slot(), warped_slot);
-        assert_eq!(
-            warped_bank.builtin_program_ids(),
-            vec![
-                system_program::id(),
-                solana_config_program::id(),
-                solana_stake_program::id(),
-                solana_vote_program::id(),
-                Pubkey::from_str("7saCc6X5a2syoYANA5oUUnPZLcLMfKoSjiDhFU5fbpoK").unwrap(),
-            ]
-        );
+pub(crate) fn get() -> Builtins {
+    Builtins {
+        genesis_builtins: genesis_builtins(),
+        feature_builtins: feature_builtins(),
     }
 }

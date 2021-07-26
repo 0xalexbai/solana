@@ -1,17 +1,15 @@
 use solana_cli::{
     cli::{process_command, request_and_confirm_airdrop, CliCommand, CliConfig},
-    cli_output::OutputFormat,
-    nonce,
-    offline::{
-        blockhash_query::{self, BlockhashQuery},
-        parse_sign_only_reply_string,
-    },
     spend_utils::SpendAmount,
     test_utils::{check_ready, check_recent_balance},
 };
-use solana_client::rpc_client::RpcClient;
-use solana_core::contact_info::ContactInfo;
-use solana_core::validator::{TestValidator, TestValidatorOptions};
+use solana_cli_output::{parse_sign_only_reply_string, OutputFormat};
+use solana_client::{
+    blockhash_query::{self, BlockhashQuery},
+    nonce_utils,
+    rpc_client::RpcClient,
+};
+use solana_core::test_validator::TestValidator;
 use solana_faucet::faucet::run_local_faucet;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
@@ -20,69 +18,49 @@ use solana_sdk::{
     signature::{keypair_from_seed, Keypair, Signer},
     system_program,
 };
-use std::{fs::remove_dir_all, sync::mpsc::channel};
+use solana_streamer::socket::SocketAddrSpace;
 
 #[test]
 fn test_nonce() {
-    solana_logger::setup();
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = mint_keypair.pubkey();
+    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let test_validator =
+        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
-    full_battery_tests(leader_data, alice, None, false);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
+    full_battery_tests(test_validator, None, false);
 }
 
 #[test]
 fn test_nonce_with_seed() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = mint_keypair.pubkey();
+    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let test_validator =
+        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
-    full_battery_tests(leader_data, alice, Some(String::from("seed")), false);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
+    full_battery_tests(test_validator, Some(String::from("seed")), false);
 }
 
 #[test]
 fn test_nonce_with_authority() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice,
-        ledger_path,
-        ..
-    } = TestValidator::run();
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = mint_keypair.pubkey();
+    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let test_validator =
+        TestValidator::with_no_fees(mint_pubkey, Some(faucet_addr), SocketAddrSpace::Unspecified);
 
-    full_battery_tests(leader_data, alice, None, true);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
+    full_battery_tests(test_validator, None, true);
 }
 
 fn full_battery_tests(
-    leader_data: ContactInfo,
-    alice: Keypair,
+    test_validator: TestValidator,
     seed: Option<String>,
     use_nonce_authority: bool,
 ) {
-    let (sender, receiver) = channel();
-    run_local_faucet(alice, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
-
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
-    let json_rpc_url = format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
+    let json_rpc_url = test_validator.rpc_url();
 
     let mut config_payer = CliConfig::recent_for_tests();
     config_payer.json_rpc_url = json_rpc_url.clone();
@@ -91,10 +69,9 @@ fn full_battery_tests(
 
     request_and_confirm_airdrop(
         &rpc_client,
-        &faucet_addr,
+        &config_payer,
         &config_payer.signers[0].pubkey(),
         2000,
-        &config_payer,
     )
     .unwrap();
     check_recent_balance(2000, &rpc_client, &config_payer.signers[0].pubkey());
@@ -128,6 +105,7 @@ fn full_battery_tests(
         nonce_account: 1,
         seed,
         nonce_authority: optional_authority,
+        memo: None,
         amount: SpendAmount::Some(1000),
     };
 
@@ -161,6 +139,7 @@ fn full_battery_tests(
     config_payer.command = CliCommand::NewNonce {
         nonce_account,
         nonce_authority: index,
+        memo: None,
     };
     process_command(&config_payer).unwrap();
 
@@ -173,11 +152,12 @@ fn full_battery_tests(
     assert_ne!(first_nonce, third_nonce);
 
     // Withdraw from nonce account
-    let payee_pubkey = Pubkey::new_rand();
+    let payee_pubkey = solana_sdk::pubkey::new_rand();
     config_payer.signers = authorized_signers;
     config_payer.command = CliCommand::WithdrawFromNonceAccount {
         nonce_account,
         nonce_authority: index,
+        memo: None,
         destination_account_pubkey: payee_pubkey,
         lamports: 100,
     };
@@ -198,6 +178,7 @@ fn full_battery_tests(
     config_payer.command = CliCommand::AuthorizeNonceAccount {
         nonce_account,
         nonce_authority: index,
+        memo: None,
         new_authority: new_authority.pubkey(),
     };
     process_command(&config_payer).unwrap();
@@ -206,6 +187,7 @@ fn full_battery_tests(
     config_payer.command = CliCommand::NewNonce {
         nonce_account,
         nonce_authority: index,
+        memo: None,
     };
     process_command(&config_payer).unwrap_err();
 
@@ -214,6 +196,7 @@ fn full_battery_tests(
     config_payer.command = CliCommand::NewNonce {
         nonce_account,
         nonce_authority: 1,
+        memo: None,
     };
     process_command(&config_payer).unwrap();
 
@@ -221,6 +204,7 @@ fn full_battery_tests(
     config_payer.command = CliCommand::WithdrawFromNonceAccount {
         nonce_account,
         nonce_authority: 1,
+        memo: None,
         destination_account_pubkey: payee_pubkey,
         lamports: 100,
     };
@@ -232,43 +216,36 @@ fn full_battery_tests(
 
 #[test]
 fn test_create_account_with_seed() {
-    let TestValidator {
-        server,
-        leader_data,
-        alice: mint_keypair,
-        ledger_path,
-        ..
-    } = TestValidator::run_with_options(TestValidatorOptions {
-        fees: 1,
-        bootstrap_validator_lamports: 42_000,
-        ..TestValidatorOptions::default()
-    });
-
-    let (sender, receiver) = channel();
-    run_local_faucet(mint_keypair, sender, None);
-    let faucet_addr = receiver.recv().unwrap();
+    solana_logger::setup();
+    let mint_keypair = Keypair::new();
+    let mint_pubkey = mint_keypair.pubkey();
+    let faucet_addr = run_local_faucet(mint_keypair, None);
+    let test_validator = TestValidator::with_custom_fees(
+        mint_pubkey,
+        1,
+        Some(faucet_addr),
+        SocketAddrSpace::Unspecified,
+    );
 
     let offline_nonce_authority_signer = keypair_from_seed(&[1u8; 32]).unwrap();
     let online_nonce_creator_signer = keypair_from_seed(&[2u8; 32]).unwrap();
     let to_address = Pubkey::new(&[3u8; 32]);
-    let config = CliConfig::recent_for_tests();
 
     // Setup accounts
-    let rpc_client = RpcClient::new_socket(leader_data.rpc);
+    let rpc_client =
+        RpcClient::new_with_commitment(test_validator.rpc_url(), CommitmentConfig::processed());
     request_and_confirm_airdrop(
         &rpc_client,
-        &faucet_addr,
+        &CliConfig::recent_for_tests(),
         &offline_nonce_authority_signer.pubkey(),
         42,
-        &config,
     )
     .unwrap();
     request_and_confirm_airdrop(
         &rpc_client,
-        &faucet_addr,
+        &CliConfig::recent_for_tests(),
         &online_nonce_creator_signer.pubkey(),
         4242,
-        &config,
     )
     .unwrap();
     check_recent_balance(42, &rpc_client, &offline_nonce_authority_signer.pubkey());
@@ -286,13 +263,13 @@ fn test_create_account_with_seed() {
     check_recent_balance(0, &rpc_client, &nonce_address);
 
     let mut creator_config = CliConfig::recent_for_tests();
-    creator_config.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    creator_config.json_rpc_url = test_validator.rpc_url();
     creator_config.signers = vec![&online_nonce_creator_signer];
     creator_config.command = CliCommand::CreateNonceAccount {
         nonce_account: 0,
         seed: Some(seed),
         nonce_authority: Some(authority_pubkey),
+        memo: None,
         amount: SpendAmount::Some(241),
     };
     process_command(&creator_config).unwrap();
@@ -302,11 +279,14 @@ fn test_create_account_with_seed() {
     check_recent_balance(0, &rpc_client, &to_address);
 
     // Fetch nonce hash
-    let nonce_hash =
-        nonce::get_account_with_commitment(&rpc_client, &nonce_address, CommitmentConfig::recent())
-            .and_then(|ref a| nonce::data_from_account(a))
-            .unwrap()
-            .blockhash;
+    let nonce_hash = nonce_utils::get_account_with_commitment(
+        &rpc_client,
+        &nonce_address,
+        CommitmentConfig::processed(),
+    )
+    .and_then(|ref a| nonce_utils::data_from_account(a))
+    .unwrap()
+    .blockhash;
 
     // Test by creating transfer TX with nonce, fully offline
     let mut authority_config = CliConfig::recent_for_tests();
@@ -320,11 +300,16 @@ fn test_create_account_with_seed() {
         to: to_address,
         from: 0,
         sign_only: true,
+        dump_transaction_message: true,
+        allow_unfunded_recipient: true,
         no_wait: false,
         blockhash_query: BlockhashQuery::None(nonce_hash),
         nonce_account: Some(nonce_address),
         nonce_authority: 0,
+        memo: None,
         fee_payer: 0,
+        derived_address_seed: None,
+        derived_address_program_id: None,
     };
     authority_config.output_format = OutputFormat::JsonCompact;
     let sign_only_reply = process_command(&authority_config).unwrap();
@@ -334,14 +319,15 @@ fn test_create_account_with_seed() {
 
     // And submit it
     let mut submit_config = CliConfig::recent_for_tests();
-    submit_config.json_rpc_url =
-        format!("http://{}:{}", leader_data.rpc.ip(), leader_data.rpc.port());
+    submit_config.json_rpc_url = test_validator.rpc_url();
     submit_config.signers = vec![&authority_presigner];
     submit_config.command = CliCommand::Transfer {
         amount: SpendAmount::Some(10),
         to: to_address,
         from: 0,
         sign_only: false,
+        dump_transaction_message: true,
+        allow_unfunded_recipient: true,
         no_wait: false,
         blockhash_query: BlockhashQuery::FeeCalculator(
             blockhash_query::Source::NonceAccount(nonce_address),
@@ -349,14 +335,14 @@ fn test_create_account_with_seed() {
         ),
         nonce_account: Some(nonce_address),
         nonce_authority: 0,
+        memo: None,
         fee_payer: 0,
+        derived_address_seed: None,
+        derived_address_program_id: None,
     };
     process_command(&submit_config).unwrap();
     check_recent_balance(241, &rpc_client, &nonce_address);
     check_recent_balance(31, &rpc_client, &offline_nonce_authority_signer.pubkey());
     check_recent_balance(4000, &rpc_client, &online_nonce_creator_signer.pubkey());
     check_recent_balance(10, &rpc_client, &to_address);
-
-    server.close().unwrap();
-    remove_dir_all(ledger_path).unwrap();
 }

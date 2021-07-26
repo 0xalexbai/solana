@@ -1,6 +1,6 @@
 use super::*;
-use solana_ledger::entry::Entry;
-use solana_ledger::shred::{Shredder, RECOMMENDED_FEC_RATE};
+use solana_entry::entry::Entry;
+use solana_ledger::shred::Shredder;
 use solana_sdk::hash::Hash;
 use solana_sdk::signature::Keypair;
 
@@ -9,16 +9,14 @@ pub(super) struct BroadcastFakeShredsRun {
     last_blockhash: Hash,
     partition: usize,
     shred_version: u16,
-    keypair: Arc<Keypair>,
 }
 
 impl BroadcastFakeShredsRun {
-    pub(super) fn new(keypair: Arc<Keypair>, partition: usize, shred_version: u16) -> Self {
+    pub(super) fn new(partition: usize, shred_version: u16) -> Self {
         Self {
             last_blockhash: Hash::default(),
             partition,
             shred_version,
-            keypair,
         }
     }
 }
@@ -26,6 +24,7 @@ impl BroadcastFakeShredsRun {
 impl BroadcastRun for BroadcastFakeShredsRun {
     fn run(
         &mut self,
+        keypair: &Keypair,
         blockstore: &Arc<Blockstore>,
         receiver: &Receiver<WorkingBankEntry>,
         socket_sender: &Sender<(TransmitShreds, Option<BroadcastShredBatchInfo>)>,
@@ -47,14 +46,13 @@ impl BroadcastRun for BroadcastFakeShredsRun {
         let shredder = Shredder::new(
             bank.slot(),
             bank.parent().unwrap().slot(),
-            RECOMMENDED_FEC_RATE,
-            self.keypair.clone(),
             (bank.tick_height() % bank.ticks_per_slot()) as u8,
             self.shred_version,
         )
         .expect("Expected to create a new shredder");
 
         let (data_shreds, coding_shreds, _) = shredder.entries_to_shreds(
+            keypair,
             &receive_results.entries,
             last_tick_height == bank.max_tick_height(),
             next_shred_index,
@@ -71,6 +69,7 @@ impl BroadcastRun for BroadcastFakeShredsRun {
             .collect();
 
         let (fake_data_shreds, fake_coding_shreds, _) = shredder.entries_to_shreds(
+            keypair,
             &fake_entries,
             last_tick_height == bank.max_tick_height(),
             next_shred_index,
@@ -106,6 +105,7 @@ impl BroadcastRun for BroadcastFakeShredsRun {
         receiver: &Arc<Mutex<TransmitReceiver>>,
         cluster_info: &ClusterInfo,
         sock: &UdpSocket,
+        _bank_forks: &Arc<RwLock<BankForks>>,
     ) -> Result<()> {
         for ((stakes, data_shreds), _) in receiver.lock().unwrap().iter() {
             let peers = cluster_info.tvu_peers();
@@ -139,16 +139,17 @@ impl BroadcastRun for BroadcastFakeShredsRun {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contact_info::ContactInfo;
-    use solana_sdk::pubkey::Pubkey;
+    use solana_gossip::contact_info::ContactInfo;
+    use solana_streamer::socket::SocketAddrSpace;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     #[test]
     fn test_tvu_peers_ordering() {
-        let cluster = ClusterInfo::new_with_invalid_keypair(ContactInfo::new_localhost(
-            &Pubkey::new_rand(),
-            0,
-        ));
+        let cluster = ClusterInfo::new(
+            ContactInfo::new_localhost(&solana_sdk::pubkey::new_rand(), 0),
+            Arc::new(Keypair::new()),
+            SocketAddrSpace::Unspecified,
+        );
         cluster.insert_info(ContactInfo::new_with_socketaddr(&SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             8080,

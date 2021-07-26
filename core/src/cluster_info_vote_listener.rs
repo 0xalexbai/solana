@@ -1,11 +1,7 @@
 use crate::{
-    cluster_info::{ClusterInfo, GOSSIP_SLEEP_MILLIS},
-    crds_value::CrdsValueLabel,
     optimistic_confirmation_verifier::OptimisticConfirmationVerifier,
-    poh_recorder::PohRecorder,
-    pubkey_references::LockedPubkeyReferences,
+    replay_stage::DUPLICATE_THRESHOLD,
     result::{Error, Result},
-    rpc_subscriptions::RpcSubscriptions,
     sigverify,
     verified_vote_packets::VerifiedVotePackets,
     vote_stake_tracker::VoteStakeTracker,
@@ -15,18 +11,29 @@ use crossbeam_channel::{
 };
 use itertools::izip;
 use log::*;
+use solana_gossip::{
+    cluster_info::{ClusterInfo, GOSSIP_SLEEP_MILLIS},
+    crds::Cursor,
+    crds_value::CrdsValueLabel,
+};
 use solana_ledger::blockstore::Blockstore;
 use solana_metrics::inc_new_counter_debug;
 use solana_perf::packet::{self, Packets};
+use solana_poh::poh_recorder::PohRecorder;
+use solana_rpc::{
+    optimistically_confirmed_bank_tracker::{BankNotification, BankNotificationSender},
+    rpc_subscriptions::RpcSubscriptions,
+};
 use solana_runtime::{
     bank::Bank,
     bank_forks::BankForks,
+    commitment::VOTE_THRESHOLD_SIZE,
     epoch_stakes::{EpochAuthorizedVoters, EpochStakes},
     stakes::Stakes,
     vote_sender_types::{ReplayVoteReceiver, ReplayedVote},
 };
 use solana_sdk::{
-    clock::{Epoch, Slot},
+    clock::{Epoch, Slot, DEFAULT_MS_PER_SLOT, DEFAULT_TICKS_PER_SLOT},
     epoch_schedule::EpochSchedule,
     hash::Hash,
     pubkey::Pubkey,
@@ -44,28 +51,35 @@ use std::{
 };
 
 // Map from a vote account to the authorized voter for an epoch
-pub type VerifiedLabelVotePacketsSender = CrossbeamSender<Vec<(CrdsValueLabel, Packets)>>;
-pub type VerifiedLabelVotePacketsReceiver = CrossbeamReceiver<Vec<(CrdsValueLabel, Packets)>>;
+pub type ThresholdConfirmedSlots = Vec<(Slot, Hash)>;
+pub type VotedHashUpdates = HashMap<Hash, Vec<Pubkey>>;
+pub type VerifiedLabelVotePacketsSender = CrossbeamSender<Vec<(CrdsValueLabel, Slot, Packets)>>;
+pub type VerifiedLabelVotePacketsReceiver = CrossbeamReceiver<Vec<(CrdsValueLabel, Slot, Packets)>>;
 pub type VerifiedVoteTransactionsSender = CrossbeamSender<Vec<Transaction>>;
 pub type VerifiedVoteTransactionsReceiver = CrossbeamReceiver<Vec<Transaction>>;
 pub type VerifiedVoteSender = CrossbeamSender<(Pubkey, Vec<Slot>)>;
 pub type VerifiedVoteReceiver = CrossbeamReceiver<(Pubkey, Vec<Slot>)>;
+pub type GossipVerifiedVoteHashSender = CrossbeamSender<(Pubkey, Slot, Hash)>;
+pub type GossipVerifiedVoteHashReceiver = CrossbeamReceiver<(Pubkey, Slot, Hash)>;
+pub type GossipDuplicateConfirmedSlotsSender = CrossbeamSender<ThresholdConfirmedSlots>;
+pub type GossipDuplicateConfirmedSlotsReceiver = CrossbeamReceiver<ThresholdConfirmedSlots>;
+
+const THRESHOLDS_TO_CHECK: [f64; 2] = [DUPLICATE_THRESHOLD, VOTE_THRESHOLD_SIZE];
 
 #[derive(Default)]
 pub struct SlotVoteTracker {
     // Maps pubkeys that have voted for this slot
     // to whether or not we've seen the vote on gossip.
     // True if seen on gossip, false if only seen in replay.
-    voted: HashMap<Arc<Pubkey>, bool>,
+    voted: HashMap<Pubkey, bool>,
     optimistic_votes_tracker: HashMap<Hash, VoteStakeTracker>,
-    updates: Option<Vec<Arc<Pubkey>>>,
+    voted_slot_updates: Option<Vec<Pubkey>>,
     gossip_only_stake: u64,
 }
 
 impl SlotVoteTracker {
-    #[allow(dead_code)]
-    pub fn get_updates(&mut self) -> Option<Vec<Arc<Pubkey>>> {
-        self.updates.take()
+    pub fn get_voted_slot_updates(&mut self) -> Option<Vec<Pubkey>> {
+        self.voted_slot_updates.take()
     }
 
     pub fn get_or_insert_optimistic_votes_tracker(&mut self, hash: Hash) -> &mut VoteStakeTracker {
@@ -84,7 +98,6 @@ pub struct VoteTracker {
     epoch_authorized_voters: RwLock<HashMap<Epoch, Arc<EpochAuthorizedVoters>>>,
     leader_schedule_epoch: RwLock<Epoch>,
     current_epoch: RwLock<Epoch>,
-    keys: LockedPubkeyReferences,
     epoch_schedule: EpochSchedule,
 }
 
@@ -97,7 +110,7 @@ impl VoteTracker {
             epoch_schedule: *root_bank.epoch_schedule(),
             ..VoteTracker::default()
         };
-        vote_tracker.process_new_root_bank(&root_bank);
+        vote_tracker.progress_with_new_root_bank(root_bank);
         assert_eq!(
             *vote_tracker.leader_schedule_epoch.read().unwrap(),
             root_bank.get_leader_schedule_epoch(root_bank.slot())
@@ -113,7 +126,7 @@ impl VoteTracker {
             let new_slot_tracker = Arc::new(RwLock::new(SlotVoteTracker {
                 voted: HashMap::new(),
                 optimistic_votes_tracker: HashMap::default(),
-                updates: None,
+                voted_slot_updates: None,
                 gossip_only_stake: 0,
             }));
             self.slot_vote_trackers
@@ -156,24 +169,22 @@ impl VoteTracker {
     }
 
     #[cfg(test)]
-    pub fn insert_vote(&self, slot: Slot, pubkey: Arc<Pubkey>) {
+    pub fn insert_vote(&self, slot: Slot, pubkey: Pubkey) {
         let mut w_slot_vote_trackers = self.slot_vote_trackers.write().unwrap();
 
         let slot_vote_tracker = w_slot_vote_trackers.entry(slot).or_default();
 
         let mut w_slot_vote_tracker = slot_vote_tracker.write().unwrap();
 
-        w_slot_vote_tracker.voted.insert(pubkey.clone(), true);
-        if let Some(ref mut updates) = w_slot_vote_tracker.updates {
-            updates.push(pubkey.clone())
+        w_slot_vote_tracker.voted.insert(pubkey, true);
+        if let Some(ref mut voted_slot_updates) = w_slot_vote_tracker.voted_slot_updates {
+            voted_slot_updates.push(pubkey)
         } else {
-            w_slot_vote_tracker.updates = Some(vec![pubkey.clone()]);
+            w_slot_vote_tracker.voted_slot_updates = Some(vec![pubkey]);
         }
-
-        self.keys.get_or_insert(&pubkey);
     }
 
-    fn update_leader_schedule_epoch(&self, root_bank: &Bank) {
+    fn progress_leader_schedule_epoch(&self, root_bank: &Bank) {
         // Update with any newly calculated epoch state about future epochs
         let start_leader_schedule_epoch = *self.leader_schedule_epoch.read().unwrap();
         let mut greatest_leader_schedule_epoch = start_leader_schedule_epoch;
@@ -204,7 +215,7 @@ impl VoteTracker {
         }
     }
 
-    fn update_new_root(&self, root_bank: &Bank) {
+    fn purge_stale_state(&self, root_bank: &Bank) {
         // Purge any outdated slot data
         let new_root = root_bank.slot();
         let root_epoch = root_bank.epoch();
@@ -219,15 +230,14 @@ impl VoteTracker {
             self.epoch_authorized_voters
                 .write()
                 .unwrap()
-                .retain(|epoch, _| epoch >= &root_epoch);
-            self.keys.purge();
+                .retain(|epoch, _| *epoch >= root_epoch);
             *self.current_epoch.write().unwrap() = root_epoch;
         }
     }
 
-    fn process_new_root_bank(&self, root_bank: &Bank) {
-        self.update_leader_schedule_epoch(root_bank);
-        self.update_new_root(root_bank);
+    fn progress_with_new_root_bank(&self, root_bank: &Bank) {
+        self.progress_leader_schedule_epoch(root_bank);
+        self.purge_stale_state(root_bank);
     }
 }
 
@@ -246,8 +256,11 @@ impl ClusterInfoVoteListener {
         bank_forks: Arc<RwLock<BankForks>>,
         subscriptions: Arc<RpcSubscriptions>,
         verified_vote_sender: VerifiedVoteSender,
+        gossip_verified_vote_hash_sender: GossipVerifiedVoteHashSender,
         replay_votes_receiver: ReplayVoteReceiver,
         blockstore: Arc<Blockstore>,
+        bank_notification_sender: Option<BankNotificationSender>,
+        cluster_confirmed_slot_sender: GossipDuplicateConfirmedSlotsSender,
     ) -> Self {
         let exit_ = exit.clone();
 
@@ -290,9 +303,12 @@ impl ClusterInfoVoteListener {
                     vote_tracker,
                     bank_forks,
                     subscriptions,
+                    gossip_verified_vote_hash_sender,
                     verified_vote_sender,
                     replay_votes_receiver,
                     blockstore,
+                    bank_notification_sender,
+                    cluster_confirmed_slot_sender,
                 );
             })
             .unwrap();
@@ -315,53 +331,42 @@ impl ClusterInfoVoteListener {
         verified_vote_label_packets_sender: VerifiedLabelVotePacketsSender,
         verified_vote_transactions_sender: VerifiedVoteTransactionsSender,
     ) -> Result<()> {
-        let mut last_ts = 0;
-        loop {
-            if exit.load(Ordering::Relaxed) {
-                return Ok(());
-            }
-            let (labels, votes, new_ts) = cluster_info.get_votes(last_ts);
+        let mut cursor = Cursor::default();
+        while !exit.load(Ordering::Relaxed) {
+            let (labels, votes) = cluster_info.get_votes(&mut cursor);
             inc_new_counter_debug!("cluster_info_vote_listener-recv_count", votes.len());
-
-            last_ts = new_ts;
             if !votes.is_empty() {
                 let (vote_txs, packets) = Self::verify_votes(votes, labels);
                 verified_vote_transactions_sender.send(vote_txs)?;
                 verified_vote_label_packets_sender.send(packets)?;
             }
-
             sleep(Duration::from_millis(GOSSIP_SLEEP_MILLIS));
         }
+        Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     fn verify_votes(
         votes: Vec<Transaction>,
         labels: Vec<CrdsValueLabel>,
-    ) -> (Vec<Transaction>, Vec<(CrdsValueLabel, Packets)>) {
-        let msgs = packet::to_packets_chunked(&votes, 1);
-        let r = sigverify::ed25519_verify_cpu(&msgs);
+    ) -> (Vec<Transaction>, Vec<(CrdsValueLabel, Slot, Packets)>) {
+        let mut msgs = packet::to_packets_chunked(&votes, 1);
+        sigverify::ed25519_verify_cpu(&mut msgs);
 
-        assert_eq!(
-            r.iter()
-                .map(|packets_results| packets_results.len())
-                .sum::<usize>(),
-            votes.len()
-        );
+        let (vote_txs, packets) = izip!(labels.into_iter(), votes.into_iter(), msgs,)
+            .filter_map(|(label, vote, packet)| {
+                let slot = vote_transaction::parse_vote_transaction(&vote)
+                    .and_then(|(_, vote, _)| vote.slots.last().copied())?;
 
-        let (vote_txs, packets) = izip!(
-            labels.into_iter(),
-            votes.into_iter(),
-            r.iter().flatten(),
-            msgs,
-        )
-        .filter_map(|(label, vote, verify_result, packet)| {
-            if *verify_result != 0 {
-                Some((vote, (label, packet)))
-            } else {
-                None
-            }
-        })
-        .unzip();
+                // to_packets_chunked() above split into 1 packet long chunks
+                assert_eq!(packet.packets.len(), 1);
+                if !packet.packets[0].meta.discard {
+                    Some((vote, (label, slot, packet)))
+                } else {
+                    None
+                }
+            })
+            .unzip();
         (vote_txs, packets)
     }
 
@@ -379,15 +384,20 @@ impl ClusterInfoVoteListener {
                 return Ok(());
             }
 
-            if let Err(e) = verified_vote_packets.get_and_process_vote_packets(
+            let would_be_leader = poh_recorder
+                .lock()
+                .unwrap()
+                .would_be_leader(20 * DEFAULT_TICKS_PER_SLOT);
+            if let Err(e) = verified_vote_packets.receive_and_process_vote_packets(
                 &verified_vote_label_packets_receiver,
                 &mut update_version,
+                would_be_leader,
             ) {
                 match e {
-                    Error::CrossbeamRecvTimeoutError(RecvTimeoutError::Disconnected) => {
+                    Error::CrossbeamRecvTimeout(RecvTimeoutError::Disconnected) => {
                         return Ok(());
                     }
-                    Error::CrossbeamRecvTimeoutError(RecvTimeoutError::Timeout) => (),
+                    Error::CrossbeamRecvTimeout(RecvTimeoutError::Timeout) => (),
                     _ => {
                         error!("thread {:?} error {:?}", thread::current().name(), e);
                     }
@@ -399,7 +409,10 @@ impl ClusterInfoVoteListener {
                 if let Some(bank) = bank {
                     let last_version = bank.last_vote_sync.load(Ordering::Relaxed);
                     let (new_version, msgs) = verified_vote_packets.get_latest_votes(last_version);
-                    verified_packets_sender.send(msgs)?;
+                    inc_new_counter_info!("bank_send_loop_batch_size", msgs.packets.len());
+                    inc_new_counter_info!("bank_send_loop_num_batches", 1);
+                    verified_packets_sender.send(vec![msgs])?;
+                    #[allow(deprecated)]
                     bank.last_vote_sync.compare_and_swap(
                         last_version,
                         new_version,
@@ -411,60 +424,67 @@ impl ClusterInfoVoteListener {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn process_votes_loop(
         exit: Arc<AtomicBool>,
         gossip_vote_txs_receiver: VerifiedVoteTransactionsReceiver,
         vote_tracker: Arc<VoteTracker>,
         bank_forks: Arc<RwLock<BankForks>>,
         subscriptions: Arc<RpcSubscriptions>,
+        gossip_verified_vote_hash_sender: GossipVerifiedVoteHashSender,
         verified_vote_sender: VerifiedVoteSender,
         replay_votes_receiver: ReplayVoteReceiver,
         blockstore: Arc<Blockstore>,
+        bank_notification_sender: Option<BankNotificationSender>,
+        cluster_confirmed_slot_sender: GossipDuplicateConfirmedSlotsSender,
     ) -> Result<()> {
-        let mut optimistic_confirmation_verifier =
+        let mut confirmation_verifier =
             OptimisticConfirmationVerifier::new(bank_forks.read().unwrap().root());
         let mut last_process_root = Instant::now();
+        let cluster_confirmed_slot_sender = Some(cluster_confirmed_slot_sender);
         loop {
             if exit.load(Ordering::Relaxed) {
                 return Ok(());
             }
 
             let root_bank = bank_forks.read().unwrap().root_bank().clone();
-            if last_process_root.elapsed().as_millis() > 400 {
-                let unrooted_optimistic_slots = optimistic_confirmation_verifier
-                    .get_unrooted_optimistic_slots(&root_bank, &blockstore);
+            if last_process_root.elapsed().as_millis() > DEFAULT_MS_PER_SLOT as u128 {
+                let unrooted_optimistic_slots = confirmation_verifier
+                    .verify_for_unrooted_optimistic_slots(&root_bank, &blockstore);
                 // SlotVoteTracker's for all `slots` in `unrooted_optimistic_slots`
                 // should still be available because we haven't purged in
-                // `process_new_root_bank()` yet, which is called below
+                // `progress_with_new_root_bank()` yet, which is called below
                 OptimisticConfirmationVerifier::log_unrooted_optimistic_slots(
                     &root_bank,
                     &vote_tracker,
                     &unrooted_optimistic_slots,
                 );
-                vote_tracker.process_new_root_bank(&root_bank);
+                vote_tracker.progress_with_new_root_bank(&root_bank);
                 last_process_root = Instant::now();
             }
-            let optimistic_confirmed_slots = Self::get_and_process_votes(
+            let confirmed_slots = Self::listen_and_confirm_votes(
                 &gossip_vote_txs_receiver,
                 &vote_tracker,
                 &root_bank,
                 &subscriptions,
+                &gossip_verified_vote_hash_sender,
                 &verified_vote_sender,
                 &replay_votes_receiver,
+                &bank_notification_sender,
+                &cluster_confirmed_slot_sender,
             );
-
-            if let Err(e) = optimistic_confirmed_slots {
-                match e {
-                    Error::CrossbeamRecvTimeoutError(RecvTimeoutError::Timeout)
-                    | Error::ReadyTimeoutError => (),
+            match confirmed_slots {
+                Ok(confirmed_slots) => {
+                    confirmation_verifier
+                        .add_new_optimistic_confirmed_slots(confirmed_slots.clone());
+                }
+                Err(e) => match e {
+                    Error::CrossbeamRecvTimeout(RecvTimeoutError::Timeout)
+                    | Error::ReadyTimeout => (),
                     _ => {
                         error!("thread {:?} error {:?}", thread::current().name(), e);
                     }
-                }
-            } else {
-                let optimistic_confirmed_slots = optimistic_confirmed_slots.unwrap();
-                optimistic_confirmation_verifier
-                    .add_new_optimistic_confirmed_slots(optimistic_confirmed_slots);
+                },
             }
         }
     }
@@ -475,27 +495,34 @@ impl ClusterInfoVoteListener {
         vote_tracker: &VoteTracker,
         root_bank: &Bank,
         subscriptions: &RpcSubscriptions,
+        gossip_verified_vote_hash_sender: &GossipVerifiedVoteHashSender,
         verified_vote_sender: &VerifiedVoteSender,
         replay_votes_receiver: &ReplayVoteReceiver,
-    ) -> Result<Vec<(Slot, Hash)>> {
-        Self::get_and_process_votes(
+    ) -> Result<ThresholdConfirmedSlots> {
+        Self::listen_and_confirm_votes(
             gossip_vote_txs_receiver,
             vote_tracker,
             root_bank,
             subscriptions,
+            gossip_verified_vote_hash_sender,
             verified_vote_sender,
             replay_votes_receiver,
+            &None,
+            &None,
         )
     }
 
-    fn get_and_process_votes(
+    fn listen_and_confirm_votes(
         gossip_vote_txs_receiver: &VerifiedVoteTransactionsReceiver,
         vote_tracker: &VoteTracker,
         root_bank: &Bank,
         subscriptions: &RpcSubscriptions,
+        gossip_verified_vote_hash_sender: &GossipVerifiedVoteHashSender,
         verified_vote_sender: &VerifiedVoteSender,
         replay_votes_receiver: &ReplayVoteReceiver,
-    ) -> Result<Vec<(Slot, Hash)>> {
+        bank_notification_sender: &Option<BankNotificationSender>,
+        cluster_confirmed_slot_sender: &Option<GossipDuplicateConfirmedSlotsSender>,
+    ) -> Result<ThresholdConfirmedSlots> {
         let mut sel = Select::new();
         sel.recv(gossip_vote_txs_receiver);
         sel.recv(replay_votes_receiver);
@@ -516,13 +543,16 @@ impl ClusterInfoVoteListener {
             let gossip_vote_txs: Vec<_> = gossip_vote_txs_receiver.try_iter().flatten().collect();
             let replay_votes: Vec<_> = replay_votes_receiver.try_iter().collect();
             if !gossip_vote_txs.is_empty() || !replay_votes.is_empty() {
-                return Ok(Self::process_votes(
+                return Ok(Self::filter_and_confirm_with_new_votes(
                     vote_tracker,
                     gossip_vote_txs,
                     replay_votes,
                     root_bank,
                     subscriptions,
+                    gossip_verified_vote_hash_sender,
                     verified_vote_sender,
+                    bank_notification_sender,
+                    cluster_confirmed_slot_sender,
                 ));
             } else {
                 remaining_wait_time = remaining_wait_time
@@ -533,76 +563,93 @@ impl ClusterInfoVoteListener {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn update_new_votes(
+    fn track_new_votes_and_notify_confirmations(
         vote: Vote,
         vote_pubkey: &Pubkey,
         vote_tracker: &VoteTracker,
         root_bank: &Bank,
         subscriptions: &RpcSubscriptions,
         verified_vote_sender: &VerifiedVoteSender,
-        diff: &mut HashMap<Slot, HashMap<Arc<Pubkey>, bool>>,
-        new_optimistic_confirmed_slots: &mut Vec<(Slot, Hash)>,
+        gossip_verified_vote_hash_sender: &GossipVerifiedVoteHashSender,
+        diff: &mut HashMap<Slot, HashMap<Pubkey, bool>>,
+        new_optimistic_confirmed_slots: &mut ThresholdConfirmedSlots,
         is_gossip_vote: bool,
+        bank_notification_sender: &Option<BankNotificationSender>,
+        cluster_confirmed_slot_sender: &Option<GossipDuplicateConfirmedSlotsSender>,
     ) {
         if vote.slots.is_empty() {
             return;
         }
 
-        let last_vote_slot = vote.slots.last().unwrap();
+        let last_vote_slot = *vote.slots.last().unwrap();
+        let last_vote_hash = vote.hash;
 
         let root = root_bank.slot();
-        let last_vote_hash = vote.hash;
         let mut is_new_vote = false;
-        for slot in vote.slots.iter().rev() {
-            // If slot is before the root, or so far ahead we don't have
-            // stake information, then ignore it
-            let epoch = root_bank.epoch_schedule().get_epoch(*slot);
+        // If slot is before the root, ignore it
+        for slot in vote.slots.iter().filter(|slot| **slot > root).rev() {
+            let slot = *slot;
+
+            // if we don't have stake information, ignore it
+            let epoch = root_bank.epoch_schedule().get_epoch(slot);
             let epoch_stakes = root_bank.epoch_stakes(epoch);
-            if *slot <= root || epoch_stakes.is_none() {
+            if epoch_stakes.is_none() {
                 continue;
             }
             let epoch_stakes = epoch_stakes.unwrap();
-            let epoch_vote_accounts = Stakes::vote_accounts(epoch_stakes.stakes());
-            let total_epoch_stake = epoch_stakes.total_stake();
-            let unduplicated_pubkey = vote_tracker.keys.get_or_insert(&vote_pubkey);
 
             // The last vote slot, which is the greatest slot in the stack
             // of votes in a vote transaction, qualifies for optimistic confirmation.
-            let update_optimistic_confirmation_info = if slot == last_vote_slot {
-                let stake = epoch_vote_accounts
-                    .get(&vote_pubkey)
+            if slot == last_vote_slot {
+                let vote_accounts = Stakes::vote_accounts(epoch_stakes.stakes());
+                let stake = vote_accounts
+                    .get(vote_pubkey)
                     .map(|(stake, _)| *stake)
-                    .unwrap_or(0);
-                Some((stake, last_vote_hash))
-            } else {
-                None
-            };
+                    .unwrap_or_default();
+                let total_stake = epoch_stakes.total_stake();
 
-            // If this vote for this slot qualifies for optimistic confirmation
-            if let Some((stake, hash)) = update_optimistic_confirmation_info {
                 // Fast track processing of the last slot in a vote transactions
                 // so that notifications for optimistic confirmation can be sent
                 // as soon as possible.
-                let (is_confirmed, is_new) = Self::add_optimistic_confirmation_vote(
+                let (reached_threshold_results, is_new) = Self::track_optimistic_confirmation_vote(
                     vote_tracker,
-                    *slot,
-                    hash,
-                    unduplicated_pubkey.clone(),
+                    last_vote_slot,
+                    last_vote_hash,
+                    *vote_pubkey,
                     stake,
-                    total_epoch_stake,
+                    total_stake,
                 );
 
-                if is_confirmed {
-                    new_optimistic_confirmed_slots.push((*slot, last_vote_hash));
+                if is_gossip_vote && is_new && stake > 0 {
+                    let _ = gossip_verified_vote_hash_sender.send((
+                        *vote_pubkey,
+                        last_vote_slot,
+                        last_vote_hash,
+                    ));
+                }
+
+                if reached_threshold_results[0] {
+                    if let Some(sender) = cluster_confirmed_slot_sender {
+                        let _ = sender.send(vec![(last_vote_slot, last_vote_hash)]);
+                    }
+                }
+                if reached_threshold_results[1] {
+                    new_optimistic_confirmed_slots.push((last_vote_slot, last_vote_hash));
                     // Notify subscribers about new optimistic confirmation
-                    subscriptions.notify_gossip_subscribers(*slot);
+                    if let Some(sender) = bank_notification_sender {
+                        sender
+                            .send(BankNotification::OptimisticallyConfirmed(last_vote_slot))
+                            .unwrap_or_else(|err| {
+                                warn!("bank_notification_sender failed: {:?}", err)
+                            });
+                    }
                 }
 
                 if !is_new && !is_gossip_vote {
                     // By now:
                     // 1) The vote must have come from ReplayStage,
                     // 2) We've seen this vote from replay for this hash before
-                    // (`add_optimistic_confirmation_vote()` will not set `is_new == true`
+                    // (`track_optimistic_confirmation_vote()` will not set `is_new == true`
                     // for same slot different hash), so short circuit because this vote
                     // has no new information
 
@@ -614,9 +661,9 @@ impl ClusterInfoVoteListener {
                 is_new_vote = is_new;
             }
 
-            diff.entry(*slot)
+            diff.entry(slot)
                 .or_default()
-                .entry(unduplicated_pubkey)
+                .entry(*vote_pubkey)
                 .and_modify(|seen_in_gossip_previously| {
                     *seen_in_gossip_previously = *seen_in_gossip_previously || is_gossip_vote
                 })
@@ -629,64 +676,78 @@ impl ClusterInfoVoteListener {
         }
     }
 
-    fn process_votes(
+    fn filter_gossip_votes(
+        vote_tracker: &VoteTracker,
+        vote_pubkey: &Pubkey,
+        vote: &Vote,
+        gossip_tx: &Transaction,
+    ) -> bool {
+        if vote.slots.is_empty() {
+            return false;
+        }
+        let last_vote_slot = vote.slots.last().unwrap();
+        // Votes from gossip need to be verified as they have not been
+        // verified by the replay pipeline. Determine the authorized voter
+        // based on the last vote slot. This will  drop votes from authorized
+        // voters trying to make votes for slots earlier than the epoch for
+        // which they are authorized
+        let actual_authorized_voter =
+            vote_tracker.get_authorized_voter(vote_pubkey, *last_vote_slot);
+
+        if actual_authorized_voter.is_none() {
+            return false;
+        }
+
+        // Voting without the correct authorized pubkey, dump the vote
+        if !VoteTracker::vote_contains_authorized_voter(
+            gossip_tx,
+            &actual_authorized_voter.unwrap(),
+        ) {
+            return false;
+        }
+
+        true
+    }
+
+    fn filter_and_confirm_with_new_votes(
         vote_tracker: &VoteTracker,
         gossip_vote_txs: Vec<Transaction>,
         replayed_votes: Vec<ReplayedVote>,
         root_bank: &Bank,
         subscriptions: &RpcSubscriptions,
+        gossip_verified_vote_hash_sender: &GossipVerifiedVoteHashSender,
         verified_vote_sender: &VerifiedVoteSender,
-    ) -> Vec<(Slot, Hash)> {
-        let mut diff: HashMap<Slot, HashMap<Arc<Pubkey>, bool>> = HashMap::new();
+        bank_notification_sender: &Option<BankNotificationSender>,
+        cluster_confirmed_slot_sender: &Option<GossipDuplicateConfirmedSlotsSender>,
+    ) -> ThresholdConfirmedSlots {
+        let mut diff: HashMap<Slot, HashMap<Pubkey, bool>> = HashMap::new();
         let mut new_optimistic_confirmed_slots = vec![];
 
         // Process votes from gossip and ReplayStage
-        for (i, (vote_pubkey, vote, _)) in gossip_vote_txs
+        for (is_gossip, (vote_pubkey, vote, _)) in gossip_vote_txs
             .iter()
             .filter_map(|gossip_tx| {
-                vote_transaction::parse_vote_transaction(gossip_tx).filter(
-                    |(vote_pubkey, vote, _)| {
-                        if vote.slots.is_empty() {
-                            return false;
-                        }
-                        let last_vote_slot = vote.slots.last().unwrap();
-                        // Votes from gossip need to be verified as they have not been
-                        // verified by the replay pipeline. Determine the authorized voter
-                        // based on the last vote slot. This will  drop votes from authorized
-                        // voters trying to make votes for slots earlier than the epoch for
-                        // which they are authorized
-                        let actual_authorized_voter =
-                            vote_tracker.get_authorized_voter(&vote_pubkey, *last_vote_slot);
-
-                        if actual_authorized_voter.is_none() {
-                            return false;
-                        }
-
-                        // Voting without the correct authorized pubkey, dump the vote
-                        if !VoteTracker::vote_contains_authorized_voter(
-                            &gossip_tx,
-                            &actual_authorized_voter.unwrap(),
-                        ) {
-                            return false;
-                        }
-
-                        true
-                    },
-                )
+                vote_transaction::parse_vote_transaction(gossip_tx)
+                    .filter(|(vote_pubkey, vote, _)| {
+                        Self::filter_gossip_votes(vote_tracker, vote_pubkey, vote, gossip_tx)
+                    })
+                    .map(|v| (true, v))
             })
-            .chain(replayed_votes)
-            .enumerate()
+            .chain(replayed_votes.into_iter().map(|v| (false, v)))
         {
-            Self::update_new_votes(
+            Self::track_new_votes_and_notify_confirmations(
                 vote,
                 &vote_pubkey,
-                &vote_tracker,
+                vote_tracker,
                 root_bank,
                 subscriptions,
                 verified_vote_sender,
+                gossip_verified_vote_hash_sender,
                 &mut diff,
                 &mut new_optimistic_confirmed_slots,
-                i < gossip_vote_txs.len(),
+                is_gossip,
+                bank_notification_sender,
+                cluster_confirmed_slot_sender,
             );
         }
 
@@ -707,8 +768,8 @@ impl ClusterInfoVoteListener {
                 });
             }
             let mut w_slot_tracker = slot_tracker.write().unwrap();
-            if w_slot_tracker.updates.is_none() {
-                w_slot_tracker.updates = Some(vec![]);
+            if w_slot_tracker.voted_slot_updates.is_none() {
+                w_slot_tracker.voted_slot_updates = Some(vec![]);
             }
             let mut gossip_only_stake = 0;
             let epoch = root_bank.epoch_schedule().get_epoch(slot);
@@ -728,10 +789,12 @@ impl ClusterInfoVoteListener {
                 // no other writers to `slot_vote_tracker` that
                 // `is_new || is_new_from_gossip`. In both cases we want to record
                 // `is_new_from_gossip` for the `pubkey` entry.
+                w_slot_tracker.voted.insert(pubkey, seen_in_gossip_above);
                 w_slot_tracker
-                    .voted
-                    .insert(pubkey.clone(), seen_in_gossip_above);
-                w_slot_tracker.updates.as_mut().unwrap().push(pubkey);
+                    .voted_slot_updates
+                    .as_mut()
+                    .unwrap()
+                    .push(pubkey);
             }
 
             w_slot_tracker.gossip_only_stake += gossip_only_stake
@@ -741,21 +804,21 @@ impl ClusterInfoVoteListener {
 
     // Returns if the slot was optimistically confirmed, and whether
     // the slot was new
-    fn add_optimistic_confirmation_vote(
+    fn track_optimistic_confirmation_vote(
         vote_tracker: &VoteTracker,
         slot: Slot,
         hash: Hash,
-        pubkey: Arc<Pubkey>,
+        pubkey: Pubkey,
         stake: u64,
         total_epoch_stake: u64,
-    ) -> (bool, bool) {
+    ) -> (Vec<bool>, bool) {
         let slot_tracker = vote_tracker.get_or_insert_slot_tracker(slot);
         // Insert vote and check for optimistic confirmation
         let mut w_slot_tracker = slot_tracker.write().unwrap();
 
         w_slot_tracker
             .get_or_insert_optimistic_votes_tracker(hash)
-            .add_vote_pubkey(pubkey, stake, total_epoch_stake)
+            .add_vote_pubkey(pubkey, stake, total_epoch_stake, &THRESHOLDS_TO_CHECK)
     }
 
     fn sum_stake(sum: &mut u64, epoch_stakes: Option<&EpochStakes>, pubkey: &Pubkey) {
@@ -771,6 +834,7 @@ impl ClusterInfoVoteListener {
 mod tests {
     use super::*;
     use solana_perf::packet;
+    use solana_rpc::optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank;
     use solana_runtime::{
         bank::Bank,
         commitment::BlockCommitmentCache,
@@ -804,7 +868,7 @@ mod tests {
         use bincode::serialized_size;
         info!("max vote size {}", serialized_size(&vote_tx).unwrap());
 
-        let msgs = packet::to_packets(&[vote_tx]); // panics if won't fit
+        let msgs = packet::to_packets_chunked(&[vote_tx], 1); // panics if won't fit
 
         assert_eq!(msgs.len(), 1);
     }
@@ -881,10 +945,10 @@ mod tests {
         let (vote_tracker, bank, _, _) = setup();
 
         // Check outdated slots are purged with new root
-        let new_voter = Arc::new(Pubkey::new_rand());
+        let new_voter = solana_sdk::pubkey::new_rand();
         // Make separate copy so the original doesn't count toward
         // the ref count, which would prevent cleanup
-        let new_voter_ = Arc::new(*new_voter);
+        let new_voter_ = new_voter;
         vote_tracker.insert_vote(bank.slot(), new_voter_);
         assert!(vote_tracker
             .slot_vote_trackers
@@ -892,7 +956,7 @@ mod tests {
             .unwrap()
             .contains_key(&bank.slot()));
         let bank1 = Bank::new_from_parent(&bank, &Pubkey::default(), bank.slot() + 1);
-        vote_tracker.process_new_root_bank(&bank1);
+        vote_tracker.progress_with_new_root_bank(&bank1);
         assert!(!vote_tracker
             .slot_vote_trackers
             .read()
@@ -901,7 +965,6 @@ mod tests {
 
         // Check `keys` and `epoch_authorized_voters` are purged when new
         // root bank moves to the next epoch
-        assert!(vote_tracker.keys.0.read().unwrap().contains(&new_voter));
         let current_epoch = bank.epoch();
         let new_epoch_bank = Bank::new_from_parent(
             &bank,
@@ -909,8 +972,7 @@ mod tests {
             bank.epoch_schedule()
                 .get_first_slot_in_epoch(current_epoch + 1),
         );
-        vote_tracker.process_new_root_bank(&new_epoch_bank);
-        assert!(!vote_tracker.keys.0.read().unwrap().contains(&new_voter));
+        vote_tracker.progress_with_new_root_bank(&new_epoch_bank);
         assert_eq!(
             *vote_tracker.current_epoch.read().unwrap(),
             current_epoch + 1
@@ -939,7 +1001,7 @@ mod tests {
         );
         let next_leader_schedule_bank =
             Bank::new_from_parent(&bank, &Pubkey::default(), next_leader_schedule_computed);
-        vote_tracker.update_leader_schedule_epoch(&next_leader_schedule_bank);
+        vote_tracker.progress_leader_schedule_epoch(&next_leader_schedule_bank);
         assert_eq!(
             *vote_tracker.leader_schedule_epoch.read().unwrap(),
             next_leader_schedule_epoch
@@ -965,6 +1027,7 @@ mod tests {
         let (vote_tracker, _, validator_voting_keypairs, subscriptions) = setup();
         let (votes_sender, votes_receiver) = unbounded();
         let (verified_vote_sender, _verified_vote_receiver) = unbounded();
+        let (gossip_verified_vote_hash_sender, _gossip_verified_vote_hash_receiver) = unbounded();
         let (replay_votes_sender, replay_votes_receiver) = unbounded();
 
         let GenesisConfigInfo { genesis_config, .. } =
@@ -990,13 +1053,16 @@ mod tests {
             &votes_sender,
             &replay_votes_sender,
         );
-        ClusterInfoVoteListener::get_and_process_votes(
+        ClusterInfoVoteListener::listen_and_confirm_votes(
             &votes_receiver,
             &vote_tracker,
             &bank3,
             &subscriptions,
+            &gossip_verified_vote_hash_sender,
             &verified_vote_sender,
             &replay_votes_receiver,
+            &None,
+            &None,
         )
         .unwrap();
 
@@ -1018,13 +1084,16 @@ mod tests {
             &votes_sender,
             &replay_votes_sender,
         );
-        ClusterInfoVoteListener::get_and_process_votes(
+        ClusterInfoVoteListener::listen_and_confirm_votes(
             &votes_receiver,
             &vote_tracker,
             &bank3,
             &subscriptions,
+            &gossip_verified_vote_hash_sender,
             &verified_vote_sender,
             &replay_votes_receiver,
+            &None,
+            &None,
         )
         .unwrap();
 
@@ -1073,6 +1142,7 @@ mod tests {
         let (vote_tracker, _, validator_voting_keypairs, subscriptions) = setup();
         let (votes_txs_sender, votes_txs_receiver) = unbounded();
         let (replay_votes_sender, replay_votes_receiver) = unbounded();
+        let (gossip_verified_vote_hash_sender, gossip_verified_vote_hash_receiver) = unbounded();
         let (verified_vote_sender, verified_vote_receiver) = unbounded();
 
         let GenesisConfigInfo { genesis_config, .. } =
@@ -1095,21 +1165,57 @@ mod tests {
         );
 
         // Check that all the votes were registered for each validator correctly
-        ClusterInfoVoteListener::get_and_process_votes(
+        ClusterInfoVoteListener::listen_and_confirm_votes(
             &votes_txs_receiver,
             &vote_tracker,
             &bank0,
             &subscriptions,
+            &gossip_verified_vote_hash_sender,
             &verified_vote_sender,
             &replay_votes_receiver,
+            &None,
+            &None,
         )
         .unwrap();
+
+        let mut gossip_verified_votes: HashMap<Slot, HashMap<Hash, Vec<Pubkey>>> = HashMap::new();
+        for (pubkey, slot, hash) in gossip_verified_vote_hash_receiver.try_iter() {
+            // send_vote_txs() will send each vote twice, but we should only get a notification
+            // once for each via this channel
+            let exists = gossip_verified_votes
+                .get(&slot)
+                .and_then(|slot_hashes| slot_hashes.get(&hash))
+                .map(|slot_hash_voters| slot_hash_voters.contains(&pubkey))
+                .unwrap_or(false);
+            assert!(!exists);
+            gossip_verified_votes
+                .entry(slot)
+                .or_default()
+                .entry(hash)
+                .or_default()
+                .push(pubkey);
+        }
+
+        // Only the last vote in the `gossip_vote` set should count towards
+        // the `voted_hash_updates` set. Important to note here that replay votes
+        // should not count
+        let last_gossip_vote_slot = *gossip_vote_slots.last().unwrap();
+        assert_eq!(gossip_verified_votes.len(), 1);
+        let slot_hashes = gossip_verified_votes.get(&last_gossip_vote_slot).unwrap();
+        assert_eq!(slot_hashes.len(), 1);
+        let slot_hash_votes = slot_hashes.get(&Hash::default()).unwrap();
+        assert_eq!(slot_hash_votes.len(), validator_voting_keypairs.len());
+        for voting_keypairs in &validator_voting_keypairs {
+            let pubkey = voting_keypairs.vote_keypair.pubkey();
+            assert!(slot_hash_votes.contains(&pubkey));
+        }
 
         // Check that the received votes were pushed to other commponents
         // subscribing via `verified_vote_receiver`
         let all_expected_slots: BTreeSet<_> = gossip_vote_slots
+            .clone()
             .into_iter()
-            .chain(replay_vote_slots.into_iter())
+            .chain(replay_vote_slots.clone().into_iter())
             .collect();
         let mut pubkey_to_votes: HashMap<Pubkey, BTreeSet<Slot>> = HashMap::new();
         for (received_pubkey, new_votes) in verified_vote_receiver.try_iter() {
@@ -1137,15 +1243,17 @@ mod tests {
                 let pubkey = voting_keypairs.vote_keypair.pubkey();
                 assert!(r_slot_vote_tracker.voted.contains_key(&pubkey));
                 assert!(r_slot_vote_tracker
-                    .updates
+                    .voted_slot_updates
                     .as_ref()
                     .unwrap()
                     .contains(&Arc::new(pubkey)));
-                // Only the last vote in the stack of `gossip_votes` should count towards
-                // the `optimistic` vote set.
+                // Only the last vote in the stack of `gossip_vote` and `replay_vote_slots`
+                // should count towards the `optimistic` vote set,
                 let optimistic_votes_tracker =
                     r_slot_vote_tracker.optimistic_votes_tracker(&Hash::default());
-                if vote_slot == 2 || vote_slot == 4 {
+                if vote_slot == *gossip_vote_slots.last().unwrap()
+                    || vote_slot == *replay_vote_slots.last().unwrap()
+                {
                     let optimistic_votes_tracker = optimistic_votes_tracker.unwrap();
                     assert!(optimistic_votes_tracker.voted().contains(&pubkey));
                     assert_eq!(
@@ -1182,6 +1290,7 @@ mod tests {
 
         // Send some votes to process
         let (votes_txs_sender, votes_txs_receiver) = unbounded();
+        let (gossip_verified_vote_hash_sender, _gossip_verified_vote_hash_receiver) = unbounded();
         let (verified_vote_sender, verified_vote_receiver) = unbounded();
         let (_replay_votes_sender, replay_votes_receiver) = unbounded();
 
@@ -1213,13 +1322,16 @@ mod tests {
         }
 
         // Read and process votes from channel `votes_receiver`
-        ClusterInfoVoteListener::get_and_process_votes(
+        ClusterInfoVoteListener::listen_and_confirm_votes(
             &votes_txs_receiver,
             &vote_tracker,
             &bank0,
             &subscriptions,
+            &gossip_verified_vote_hash_sender,
             &verified_vote_sender,
             &replay_votes_receiver,
+            &None,
+            &None,
         )
         .unwrap();
 
@@ -1241,7 +1353,7 @@ mod tests {
                 let pubkey = voting_keypairs.vote_keypair.pubkey();
                 assert!(r_slot_vote_tracker.voted.contains_key(&pubkey));
                 assert!(r_slot_vote_tracker
-                    .updates
+                    .voted_slot_updates
                     .as_ref()
                     .unwrap()
                     .contains(&Arc::new(pubkey)));
@@ -1262,6 +1374,7 @@ mod tests {
     fn run_test_process_votes3(switch_proof_hash: Option<Hash>) {
         let (votes_sender, votes_receiver) = unbounded();
         let (verified_vote_sender, _verified_vote_receiver) = unbounded();
+        let (gossip_verified_vote_hash_sender, _gossip_verified_vote_hash_receiver) = unbounded();
         let (replay_votes_sender, replay_votes_receiver) = unbounded();
 
         let vote_slot = 1;
@@ -1307,38 +1420,34 @@ mod tests {
                         ))
                         .unwrap();
                 }
-                let _ = ClusterInfoVoteListener::get_and_process_votes(
+                let _ = ClusterInfoVoteListener::listen_and_confirm_votes(
                     &votes_receiver,
                     &vote_tracker,
                     &bank,
                     &subscriptions,
+                    &gossip_verified_vote_hash_sender,
                     &verified_vote_sender,
                     &replay_votes_receiver,
+                    &None,
+                    &None,
                 );
             }
             let slot_vote_tracker = vote_tracker.get_slot_vote_tracker(vote_slot).unwrap();
             let r_slot_vote_tracker = &slot_vote_tracker.read().unwrap();
 
+            assert_eq!(
+                r_slot_vote_tracker
+                    .optimistic_votes_tracker(&vote_bank_hash)
+                    .unwrap()
+                    .stake(),
+                100
+            );
             if events == vec![1] {
                 // Check `gossip_only_stake` is not incremented
-                assert_eq!(
-                    r_slot_vote_tracker
-                        .optimistic_votes_tracker(&vote_bank_hash)
-                        .unwrap()
-                        .stake(),
-                    100
-                );
                 assert_eq!(r_slot_vote_tracker.gossip_only_stake, 0);
             } else {
                 // Check that both the `gossip_only_stake` and `total_voted_stake` both
                 // increased
-                assert_eq!(
-                    r_slot_vote_tracker
-                        .optimistic_votes_tracker(&vote_bank_hash)
-                        .unwrap()
-                        .stake(),
-                    100
-                );
                 assert_eq!(r_slot_vote_tracker.gossip_only_stake, 100);
             }
         }
@@ -1405,13 +1514,6 @@ mod tests {
 
     #[test]
     fn test_vote_tracker_references() {
-        // The number of references that get stored for a pubkey every time
-        // a vote is added to the tracking set via a transaction. One stored in the
-        // SlotVoteTracker.voted, one in SlotVoteTracker.updates, one in
-        // SlotVoteTracker.optimistic_votes_tracker
-        let ref_count_per_vote = 3;
-        let ref_count_per_new_key = 1;
-
         // Create some voters at genesis
         let validator_keypairs: Vec<_> =
             (0..2).map(|_| ValidatorVoteKeypairs::new_rand()).collect();
@@ -1424,13 +1526,16 @@ mod tests {
             );
         let bank = Bank::new(&genesis_config);
         let exit = Arc::new(AtomicBool::new(false));
-        let bank_forks = BankForks::new(bank);
-        let bank = bank_forks.get(0).unwrap().clone();
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank = bank_forks.read().unwrap().get(0).unwrap().clone();
         let vote_tracker = VoteTracker::new(&bank);
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let subscriptions = Arc::new(RpcSubscriptions::new(
             &exit,
-            Arc::new(RwLock::new(bank_forks)),
+            bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
+            optimistically_confirmed_bank,
         ));
 
         // Send a vote to process, should add a reference to the pubkey for that voter
@@ -1449,7 +1554,8 @@ mod tests {
         )];
 
         let (verified_vote_sender, _verified_vote_receiver) = unbounded();
-        ClusterInfoVoteListener::process_votes(
+        let (gossip_verified_vote_hash_sender, _gossip_verified_vote_hash_receiver) = unbounded();
+        ClusterInfoVoteListener::filter_and_confirm_with_new_votes(
             &vote_tracker,
             vote_tx,
             // Add gossip vote for same slot, should not affect outcome
@@ -1460,24 +1566,11 @@ mod tests {
             )],
             &bank,
             &subscriptions,
+            &gossip_verified_vote_hash_sender,
             &verified_vote_sender,
+            &None,
+            &None,
         );
-        let ref_count = Arc::strong_count(
-            &vote_tracker
-                .keys
-                .0
-                .read()
-                .unwrap()
-                .get(&validator0_keypairs.vote_keypair.pubkey())
-                .unwrap(),
-        );
-
-        // This new pubkey submitted a vote for a slot, so ref count is
-        // `ref_count_per_vote + ref_count_per_new_key`.
-        // +ref_count_per_new_key for the new pubkey  in `vote_tracker.keys` and
-        // +ref_count_per_vote for the one new vote
-        let mut current_ref_count = ref_count_per_vote + ref_count_per_new_key;
-        assert_eq!(ref_count, current_ref_count);
 
         // Setup next epoch
         let old_epoch = bank.get_leader_schedule_epoch(bank.slot());
@@ -1519,7 +1612,7 @@ mod tests {
 
         let new_root_bank =
             Bank::new_from_parent(&bank, &Pubkey::default(), first_slot_in_new_epoch - 2);
-        ClusterInfoVoteListener::process_votes(
+        ClusterInfoVoteListener::filter_and_confirm_with_new_votes(
             &vote_tracker,
             vote_txs,
             vec![(
@@ -1529,37 +1622,11 @@ mod tests {
             )],
             &new_root_bank,
             &subscriptions,
+            &gossip_verified_vote_hash_sender,
             &verified_vote_sender,
+            &None,
+            &None,
         );
-
-        // Check new replay vote pubkey first
-        let ref_count = Arc::strong_count(
-            &vote_tracker
-                .keys
-                .0
-                .read()
-                .unwrap()
-                .get(&validator_keypairs[1].vote_keypair.pubkey())
-                .unwrap(),
-        );
-        // This new pubkey submitted a replay vote for a slot, so ref count is
-        // `ref_count_per_optimistic_vote + ref_count_per_new_key`.
-        // +ref_count_per_new_key for the new pubkey  in `vote_tracker.keys` and
-        // +ref_count_per_optimistic_vote for the one new vote
-        assert_eq!(ref_count, ref_count_per_vote + ref_count_per_new_key);
-
-        // Check the existing pubkey
-        let ref_count = Arc::strong_count(
-            &vote_tracker
-                .keys
-                .0
-                .read()
-                .unwrap()
-                .get(&validator0_keypairs.vote_keypair.pubkey())
-                .unwrap(),
-        );
-        current_ref_count += 2 * ref_count_per_vote;
-        assert_eq!(ref_count, current_ref_count);
     }
 
     fn setup() -> (
@@ -1579,12 +1646,15 @@ mod tests {
         let bank = Bank::new(&genesis_config);
         let vote_tracker = VoteTracker::new(&bank);
         let exit = Arc::new(AtomicBool::new(false));
-        let bank_forks = BankForks::new(bank);
-        let bank = bank_forks.get(0).unwrap().clone();
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank = bank_forks.read().unwrap().get(0).unwrap().clone();
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let subscriptions = Arc::new(RpcSubscriptions::new(
             &exit,
-            Arc::new(RwLock::new(bank_forks)),
+            bank_forks,
             Arc::new(RwLock::new(BlockCommitmentCache::default())),
+            optimistically_confirmed_bank,
         ));
 
         // Integrity Checks
@@ -1628,8 +1698,8 @@ mod tests {
         assert!(packets.is_empty());
     }
 
-    fn verify_packets_len(packets: &[(CrdsValueLabel, Packets)], ref_value: usize) {
-        let num_packets: usize = packets.iter().map(|p| p.1.packets.len()).sum();
+    fn verify_packets_len(packets: &[(CrdsValueLabel, Slot, Packets)], ref_value: usize) {
+        let num_packets: usize = packets.iter().map(|(_, _, p)| p.packets.len()).sum();
         assert_eq!(num_packets, ref_value);
     }
 
@@ -1651,7 +1721,7 @@ mod tests {
     fn run_test_verify_votes_1_pass(hash: Option<Hash>) {
         let vote_tx = test_vote_tx(hash);
         let votes = vec![vote_tx];
-        let labels = vec![CrdsValueLabel::Vote(0, Pubkey::new_rand())];
+        let labels = vec![CrdsValueLabel::Vote(0, solana_sdk::pubkey::new_rand())];
         let (vote_txs, packets) = ClusterInfoVoteListener::verify_votes(votes, labels);
         assert_eq!(vote_txs.len(), 1);
         verify_packets_len(&packets, 1);
@@ -1668,7 +1738,7 @@ mod tests {
         let mut bad_vote = vote_tx.clone();
         bad_vote.signatures[0] = Signature::default();
         let votes = vec![vote_tx.clone(), bad_vote, vote_tx];
-        let label = CrdsValueLabel::Vote(0, Pubkey::new_rand());
+        let label = CrdsValueLabel::Vote(0, solana_sdk::pubkey::new_rand());
         let labels: Vec<_> = (0..votes.len()).map(|_| label.clone()).collect();
         let (vote_txs, packets) = ClusterInfoVoteListener::verify_votes(votes, labels);
         assert_eq!(vote_txs.len(), 2);

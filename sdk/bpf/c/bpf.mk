@@ -14,20 +14,16 @@ TEST_PREFIX ?= test_
 OUT_DIR ?= ./out
 OS := $(shell uname)
 
-ifeq ($(DOCKER),1)
-$(warning DOCKER=1 is experimential and may not work as advertised)
-LLVM_DIR = $(LOCAL_PATH)../dependencies/llvm-docker/
-LLVM_SYSTEM_INC_DIRS := /usr/local/lib/clang/8.0.0/include
-else
-LLVM_DIR = $(LOCAL_PATH)../dependencies/llvm-native/
-LLVM_SYSTEM_INC_DIRS := $(LLVM_DIR)/lib/clang/8.0.0/include
-endif
+LLVM_DIR = $(LOCAL_PATH)../dependencies/bpf-tools/llvm
+LLVM_SYSTEM_INC_DIRS := $(LLVM_DIR)/lib/clang/12.0.1/include
+COMPILER_RT_DIR = $(LOCAL_PATH)../dependencies/bpf-tools/rust/lib/rustlib/bpfel-unknown-unknown/lib
 
 ifdef LLVM_DIR
 CC := $(LLVM_DIR)/bin/clang
 CXX := $(LLVM_DIR)/bin/clang++
 LLD := $(LLVM_DIR)/bin/ld.lld
 OBJ_DUMP := $(LLVM_DIR)/bin/llvm-objdump
+READ_ELF := $(LLVM_DIR)/bin/llvm-readelf
 endif
 
 SYSTEM_INC_DIRS := \
@@ -50,6 +46,7 @@ BPF_C_FLAGS := \
   $(C_FLAGS) \
   -target bpf \
   -fPIC \
+  -march=bpfel+solana
 
 BPF_CXX_FLAGS := \
   $(CXX_FLAGS) \
@@ -59,6 +56,7 @@ BPF_CXX_FLAGS := \
   -fno-exceptions \
   -fno-asynchronous-unwind-tables \
   -fno-unwind-tables \
+  -march=bpfel+solana
 
 BPF_LLD_FLAGS := \
   -z notext \
@@ -68,9 +66,11 @@ BPF_LLD_FLAGS := \
   --entry entrypoint \
 
 OBJ_DUMP_FLAGS := \
-  -color \
-  -source \
-  -disassemble \
+  --source \
+  --disassemble \
+
+READ_ELF_FLAGS := \
+  --all \
 
 TESTFRAMEWORK_RPATH := $(abspath $(LOCAL_PATH)../dependencies/criterion/lib)
 TESTFRAMEWORK_FLAGS := \
@@ -126,7 +126,8 @@ help:
 	@echo '  - make all - Build all the programs and tests, run the tests'
 	@echo '  - make programs - Build all the programs'
 	@echo '  - make tests - Build and run all tests'
-	@echo '  - make dump_<program name> - Dumps the contents of the program to stdout'
+	@echo '  - make dump_<program name> - Dump the contents of the program to stdout'
+	@echo '  - make readelf_<program name> - Display information about the ELF binary'
 	@echo '  - make <program name> - Build a single program by name'
 	@echo '  - make <test name> - Build and run a single test by name'
 	@echo ''
@@ -137,7 +138,7 @@ help:
 	$(foreach name, $(TEST_NAMES), @echo '  - $(name)'$(\n))
 	@echo ''
 	@echo 'Example:'
-	@echo '  - Assuming a programed named foo (src/foo/foo.c)'
+	@echo '  - Assuming a program named foo (src/foo/foo.c)'
 	@echo '    - make foo'
 	@echo '    - make dump_foo'
 	@echo ''
@@ -146,14 +147,28 @@ define C_RULE
 $1: $2
 	@echo "[cc] $1 ($2)"
 	$(_@)mkdir -p $(dir $1)
-	$(_@)$(CC) $(BPF_C_FLAGS) -o $1 -c $2 -MD -MF $(1:.o=.d)
+	$(_@)$(CC) $(BPF_C_FLAGS) -o $1 -c $2
 endef
 
 define CC_RULE
-$1: $2 
+$1: $2
 	@echo "[cxx] $1 ($2)"
 	$(_@)mkdir -p $(dir $1)
-	$(_@)$(CXX) $(BPF_CXX_FLAGS) -o $1 -c $2 -MD -MF $(1:.o=.d)
+	$(_@)$(CXX) $(BPF_CXX_FLAGS) -o $1 -c $2
+endef
+
+define D_RULE
+$1: $2 $(LOCAL_PATH)/bpf.mk
+	@echo "[GEN] $1 ($2)"
+	$(_@)mkdir -p $(dir $1)
+	$(_@)$(CC) -M -MT '$(basename $1).o' $(BPF_C_FLAGS) $2 | sed 's,\($(basename $1)\)\.o[ :]*,\1.o $1 : ,g' > $1
+endef
+
+define DXX_RULE
+$1: $2 $(LOCAL_PATH)/bpf.mk
+	@echo "[GEN] $1 ($2)"
+	$(_@)mkdir -p $(dir $1)
+	$(_@)$(CXX) -M -MT '$(basename $1).o' $(BPF_CXX_FLAGS) $2 | sed 's,\($(basename $1)\)\.o[ :]*,\1.o $1 : ,g' > $1
 endef
 
 define O_RULE
@@ -167,14 +182,19 @@ define SO_RULE
 $1: $2
 	@echo "[lld] $1 ($2)"
 	$(_@)mkdir -p $(dir $1)
-	$(_@)$(LLD) $(BPF_LLD_FLAGS) -o $1 $2
+	$(_@)$(LLD) $(BPF_LLD_FLAGS) -o $1 $2 $(COMPILER_RT_DIR)/libcompiler_builtins-*.rlib
+ifeq (,$(wildcard $(subst .so,-keypair.json,$1)))
+	$(_@)solana-keygen new --no-passphrase --silent -o $(subst .so,-keypair.json,$1)
+endif
+	@echo To deploy this program:
+	@echo $$$$ solana program deploy $(abspath $1)
 endef
 
 define TEST_C_RULE
 $1: $2
 	@echo "[test cc] $1 ($2)"
 	$(_@)mkdir -p $(dir $1)
-	$(_@)$(CC) $(TEST_C_FLAGS) -o $1 $2 -MD -MF $(1:.o=.d)
+	$(_@)$(CC) $(TEST_C_FLAGS) -o $1 $2
 	$(_@)$(MACOS_ADJUST_TEST_DYLIB) $1
 endef
 
@@ -182,12 +202,27 @@ define TEST_CC_RULE
 $1: $2
 	@echo "[test cxx] $1 ($2)"
 	$(_@)mkdir -p $(dir $1)
-	$(_@)$(CXX) $(TEST_CXX_FLAGS) -o $1 $2 -MD -MF $(1:.o=.d)
+	$(_@)$(CXX) $(TEST_CXX_FLAGS) -o $1 $2
 	$(_@)$(MACOS_ADJUST_TEST_DYLIB) $1
+endef
+
+define TEST_D_RULE
+$1: $2 $(LOCAL_PATH)/bpf.mk
+	@echo "[GEN] $1 ($2)"
+	$(_@)mkdir -p $(dir $1)
+	$(_@)$(CC) -M -MT '$(basename $1)' $(TEST_C_FLAGS) $2 | sed 's,\($(basename $1)\)[ :]*,\1 $1 : ,g' > $1
+endef
+
+define TEST_DXX_RULE
+$1: $2 $(LOCAL_PATH)/bpf.mk
+	@echo "[GEN] $1 ($2)"
+	$(_@)mkdir -p $(dir $1)
+	$(_@)$(CXX) -M -MT '$(basename $1)' $(TEST_CXX_FLAGS) $2 | sed 's,\($(basename $1)\)[ :]*,\1 $1 : ,g' > $1
 endef
 
 define TEST_EXEC_RULE
 $1: $2
+	LD_LIBRARY_PATH=$(TESTFRAMEWORK_RPATH) \
 	$2$(\n)
 endef
 
@@ -217,8 +252,10 @@ $(foreach PROGRAM, $(PROGRAM_NAMES), \
 	$(eval $($(PROGRAM)_SRCS): $(INSTALL_SH)) \
   $(eval $(call SO_RULE,$(OUT_DIR)/$(PROGRAM).so,$($(PROGRAM)_OBJS))) \
   $(foreach _,$(filter %.c,$($(PROGRAM)_SRCS)), \
+    $(eval $(call D_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.c=%.d)),$_)) \
     $(eval $(call C_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.c=%.o)),$_))) \
   $(foreach _,$(filter %.cc,$($(PROGRAM)_SRCS)), \
+    $(eval $(call DXX_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.cc=%.d)),$_)) \
     $(eval $(call CC_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.cc=%.o)),$_))) \
   \
   $(eval TESTS := $(notdir $(basename $(wildcard $(SRC_DIR)/$(PROGRAM)/$(TEST_PREFIX)*.c)))) \
@@ -230,8 +267,10 @@ $(foreach PROGRAM, $(PROGRAM_NAMES), \
       $(notdir $(wildcard $(SRC_DIR)/$(PROGRAM)/$(TEST).c $(SRC_DIR)/$(PROGRAM)/$(TEST).cc)))) \
 		$(eval $($(TEST)_SRCS): $(INSTALL_SH)) \
     $(foreach _,$(filter %.c,$($(TEST)_SRCS)), \
+      $(eval $(call TEST_D_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.c=%.d)),$_)) \
       $(eval $(call TEST_C_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.c=%)),$_))) \
     $(foreach _,$(filter %.cc, $($(TEST)_SRCS)), \
+      $(eval $(call TEST_DXX_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.cc=%.d)),$_)) \
       $(eval $(call TEST_CC_RULE,$(subst $(SRC_DIR),$(OUT_DIR),$(_:%.cc=%)),$_))) \
     $(eval $(call TEST_EXEC_RULE,$(TEST),$(addprefix $(OUT_DIR)/$(PROGRAM)/, $(TEST)))) \
    ) \
@@ -245,6 +284,9 @@ tests: $(TEST_NAMES)
 
 dump_%: %
 	$(_@)$(OBJ_DUMP) $(OBJ_DUMP_FLAGS) $(addprefix $(OUT_DIR)/, $(addsuffix .so, $<))
+
+readelf_%: %
+	$(_@)$(READ_ELF) $(READ_ELF_FLAGS) $(addprefix $(OUT_DIR)/, $(addsuffix .so, $<))
 
 clean:
 	rm -rf $(OUT_DIR)

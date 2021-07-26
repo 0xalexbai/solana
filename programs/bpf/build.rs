@@ -35,7 +35,7 @@ fn rerun_if_changed(files: &[&str], directories: &[&str], excludes: &[&str]) {
 }
 
 fn main() {
-    let bpf_c = !env::var("CARGO_FEATURE_BPF_C").is_err();
+    let bpf_c = env::var("CARGO_FEATURE_BPF_C").is_ok();
     if bpf_c {
         let install_dir =
             "OUT_DIR=../target/".to_string() + &env::var("PROFILE").unwrap() + &"/bpf".to_string();
@@ -52,54 +52,61 @@ fn main() {
         rerun_if_changed(&["c/makefile"], &["c/src", "../../sdk"], &["/target/"]);
     }
 
-    let bpf_rust = !env::var("CARGO_FEATURE_BPF_RUST").is_err();
+    let bpf_rust = env::var("CARGO_FEATURE_BPF_RUST").is_ok();
     if bpf_rust {
         let install_dir =
             "target/".to_string() + &env::var("PROFILE").unwrap() + &"/bpf".to_string();
 
-        assert!(Command::new("mkdir")
-            .arg("-p")
-            .arg(&install_dir)
-            .status()
-            .expect("Unable to create BPF install directory")
-            .success());
-
         let rust_programs = [
             "128bit",
             "alloc",
+            "call_depth",
+            "caller_access",
+            "custom_heap",
             "dep_crate",
+            "deprecated_loader",
             "dup_accounts",
             "error_handling",
             "external_spend",
+            "finalize",
+            "instruction_introspection",
             "invoke",
+            "invoke_and_error",
+            "invoke_and_ok",
+            "invoke_and_return",
             "invoked",
             "iter",
             "many_args",
+            "mem",
+            "membuiltins",
             "noop",
             "panic",
             "param_passing",
-            "sysval",
+            "rand",
+            "ro_modify",
+            "ro_account_modify",
+            "sanity",
+            "secp256k1_recover",
+            "sha",
+            "spoof1",
+            "spoof1_system",
+            "upgradeable",
+            "upgraded",
         ];
         for program in rust_programs.iter() {
             println!(
                 "cargo:warning=(not a warning) Building Rust-based BPF programs: solana_bpf_rust_{}",
                 program
             );
-            assert!(Command::new("bash")
-                .current_dir("rust")
-                .args(&["./do.sh", "build", program])
+            assert!(Command::new("../../cargo-build-bpf")
+                .args(&[
+                    "--manifest-path",
+                    &format!("rust/{}/Cargo.toml", program),
+                    "--bpf-out-dir",
+                    &install_dir
+                ])
                 .status()
-                .expect("Error calling do.sh from build.rs")
-                .success());
-            let src = format!(
-                "target/bpfel-unknown-unknown/release/solana_bpf_rust_{}.so",
-                program,
-            );
-            assert!(Command::new("cp")
-                .arg(&src)
-                .arg(&install_dir)
-                .status()
-                .expect(&format!("Failed to cp {} to {}", src, install_dir))
+                .expect("Error calling cargo-build-bpf from build.rs")
                 .success());
         }
 

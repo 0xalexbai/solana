@@ -3,11 +3,27 @@
 // Use this to write your custom SCSS
 //
 
-code, pre {
+code,
+pre {
   padding: 0.33rem;
   border-radius: $border-radius;
   background-color: $gray-200;
   color: $black;
+}
+
+ul.log-messages {
+  padding: 0.66rem;
+  margin: 1rem;
+  border-radius: $border-radius;
+  background-color: $gray-200;
+  color: $black;
+  list-style: none;
+  min-height: 12.5rem;
+  max-height: 20rem;
+  overflow: auto;
+  font-size: 0.8125rem;
+  font-family: SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
 }
 
 .popover-container {
@@ -57,6 +73,15 @@ code, pre {
   cursor: pointer;
 }
 
+.v-hidden {
+  visibility: hidden;
+  max-height: 0;
+}
+
+.flex-nowrap {
+  flex-wrap: nowrap;
+}
+
 .dropdown-exit {
   position: absolute;
   z-index: 100;
@@ -64,6 +89,10 @@ code, pre {
   left: 0;
   right: 0;
   bottom: 0;
+}
+
+.border-bottom-none {
+  border-bottom: 0px;
 }
 
 .opacity-50 {
@@ -152,7 +181,7 @@ h4.slot-pill {
 }
 
 .search-indicator {
-  color: hsl(0,0%,60%);
+  color: hsl(0, 0%, 60%);
   display: flex;
   padding: 8px 10px;
   padding-left: 14px;
@@ -161,7 +190,7 @@ h4.slot-pill {
   cursor: pointer;
 
   &:hover {
-    color: hsl(0,0%,40%);
+    color: hsl(0, 0%, 40%);
   }
 }
 
@@ -179,7 +208,20 @@ h4.slot-pill {
   height: 24px;
 }
 
-.address-truncate {
+.forced-truncate {
+  .address-truncate {
+    max-width: 180px;
+    display: inline-block;
+    vertical-align: bottom;
+
+    @include media-breakpoint-down(sm) {
+      max-width: 120px;
+    }
+  }
+}
+
+.address-truncate,
+.signature-truncate {
   @include media-breakpoint-down(md) {
     max-width: 180px;
     display: inline-block;
@@ -188,6 +230,57 @@ h4.slot-pill {
 
   @include media-breakpoint-down(sm) {
     max-width: 120px;
+  }
+}
+
+p.tree,
+ul.tree,
+ul.tree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+p.tree span.c-pointer {
+  color: $primary-dark;
+}
+
+ul.tree ul {
+  margin-left: 1em;
+}
+
+ul.tree li {
+  margin-left: 0.35em;
+  border-left: thin solid #808080;
+}
+
+ul.tree li:last-child {
+  border-left: none;
+}
+
+ul.tree li:before {
+  width: 1.4em;
+  height: 0.6em;
+  margin-right: 0.1em;
+  vertical-align: top;
+  border-bottom: thin solid #808080;
+  content: "";
+  display: inline-block;
+}
+
+ul.tree li:last-child:before {
+  border-left: thin solid #808080;
+}
+
+div.inner-cards {
+  margin: 1.5rem;
+
+  .card {
+    background-color: $gray-700-dark;
+  }
+
+  .table td {
+    border-top: 1px solid $gray-800-dark;
   }
 }
 
@@ -202,8 +295,8 @@ h4.slot-pill {
 #chartjs-tooltip {
   opacity: 1;
   position: absolute;
-  -webkit-transition: all .1s ease;
-  transition: all .1s ease;
+  -webkit-transition: all 0.1s ease;
+  transition: all 0.1s ease;
   pointer-events: none;
   -webkit-transform: translate(-50%, -105%);
   transform: translate(-50%, -105%);
@@ -241,6 +334,70 @@ h4.slot-pill {
     border-left: 10px solid transparent;
     -webkit-transform: translate(-50%, 0);
     transform: translate(-50%, 0);
-    content:'';
+    content: "";
   }
+}
+
+.dropdown-menu.token-filter {
+  max-height: 20rem;
+  overflow-y: auto;
+}
+
+.alert-danger.alert-scam {
+  background: red;
+  border: 1px solid red;
+}
+
+pre.data-wrap,
+pre.json-wrap {
+  max-width: 23rem;
+  white-space: pre-wrap;
+  white-space: -moz-pre-wrap;
+  white-space: -pre-wrap;
+  white-space: -o-pre-wrap;
+  word-wrap: break-word;
+}
+
+pre.json-wrap {
+  max-width: 36rem;
+}
+
+.staking-card {
+  h1 {
+    margin-bottom: 0.75rem;
+    small {
+      font-size: 1rem;
+    }
+  }
+  h5 {
+    margin-bottom: 0;
+  }
+  em {
+    font-style: normal;
+    color: $primary;
+  }
+}
+
+p.updated-time {
+  position: absolute;
+  font-size: 0.66rem;
+  margin: .375rem;
+  right: 0;
+  bottom: 0;
+}
+
+.change-positive {
+  color: $success;
+}
+
+.change-negative {
+  color: $warning;
+}
+
+.identicon-wrapper {
+  display: flex;
+}
+
+.identicon-wrapper-small {
+  margin-left: .4rem;
 }

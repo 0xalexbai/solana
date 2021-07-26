@@ -1,11 +1,11 @@
 import React from "react";
-import * as Sentry from "@sentry/react";
 import { Connection, PublicKey } from "@solana/web3.js";
 import * as Cache from "providers/cache";
 import { ActionType, FetchStatus } from "providers/cache";
 import { TokenAccountInfo } from "validators/accounts/token";
-import { useCluster } from "../cluster";
-import { coerce } from "superstruct";
+import { useCluster, Cluster } from "../cluster";
+import { create } from "superstruct";
+import { reportError } from "utils/sentry";
 
 export type TokenInfoWithPubkey = {
   info: TokenAccountInfo;
@@ -41,12 +41,13 @@ export function TokensProvider({ children }: ProviderProps) {
 }
 
 export const TOKEN_PROGRAM_ID = new PublicKey(
-  "TokenSVp5gheXUvJ6jGWGeCsgPKgnE3YgdGKRVCMY9o"
+  "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 );
 
 async function fetchAccountTokens(
   dispatch: Dispatch,
   pubkey: PublicKey,
+  cluster: Cluster,
   url: string
 ) {
   const key = pubkey.toBase58();
@@ -62,18 +63,20 @@ async function fetchAccountTokens(
   try {
     const { value } = await new Connection(
       url,
-      "recent"
+      "processed"
     ).getParsedTokenAccountsByOwner(pubkey, { programId: TOKEN_PROGRAM_ID });
     data = {
       tokens: value.map((accountInfo) => {
         const parsedInfo = accountInfo.account.data.parsed.info;
-        const info = coerce(parsedInfo, TokenAccountInfo);
+        const info = create(parsedInfo, TokenAccountInfo);
         return { info, pubkey: accountInfo.pubkey };
       }),
     };
     status = FetchStatus.Fetched;
   } catch (error) {
-    Sentry.captureException(error, { tags: { url } });
+    if (cluster !== Cluster.Custom) {
+      reportError(error, { url });
+    }
     status = FetchStatus.FetchFailed;
   }
   dispatch({ type: ActionType.Update, url, status, data, key });
@@ -101,8 +104,11 @@ export function useFetchAccountOwnedTokens() {
     );
   }
 
-  const { url } = useCluster();
-  return (pubkey: PublicKey) => {
-    fetchAccountTokens(dispatch, pubkey, url);
-  };
+  const { cluster, url } = useCluster();
+  return React.useCallback(
+    (pubkey: PublicKey) => {
+      fetchAccountTokens(dispatch, pubkey, cluster, url);
+    },
+    [dispatch, cluster, url]
+  );
 }

@@ -1,6 +1,6 @@
 use crate::erasure::ErasureConfig;
 use serde::{Deserialize, Serialize};
-use solana_sdk::clock::Slot;
+use solana_sdk::{clock::Slot, hash::Hash};
 use std::{collections::BTreeSet, ops::RangeBounds};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
@@ -51,8 +51,9 @@ pub struct ShredIndex {
 pub struct ErasureMeta {
     /// Which erasure set in the slot this is
     pub set_index: u64,
-    /// First coding index in the FEC set
-    pub first_coding_index: u64,
+    /// Deprecated field.
+    #[serde(rename = "first_coding_index")]
+    __unused: u64,
     /// Size of shards in this erasure set
     pub size: usize,
     /// Erasure configuration for this erasure set
@@ -72,6 +73,33 @@ pub enum ErasureMetaStatus {
     CanRecover,
     DataFull,
     StillNeed(usize),
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
+pub enum FrozenHashVersioned {
+    Current(FrozenHashStatus),
+}
+
+impl FrozenHashVersioned {
+    pub fn frozen_hash(&self) -> Hash {
+        match self {
+            FrozenHashVersioned::Current(frozen_hash_status) => frozen_hash_status.frozen_hash,
+        }
+    }
+
+    pub fn is_duplicate_confirmed(&self) -> bool {
+        match self {
+            FrozenHashVersioned::Current(frozen_hash_status) => {
+                frozen_hash_status.is_duplicate_confirmed
+            }
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq)]
+pub struct FrozenHashStatus {
+    pub frozen_hash: Hash,
+    pub is_duplicate_confirmed: bool,
 }
 
 impl Index {
@@ -123,6 +151,10 @@ impl ShredIndex {
         for (idx, present) in presence.into_iter() {
             self.set_present(idx, present);
         }
+    }
+
+    pub fn largest(&self) -> Option<u64> {
+        self.index.iter().rev().next().copied()
     }
 }
 
@@ -184,21 +216,19 @@ impl SlotMeta {
 }
 
 impl ErasureMeta {
-    pub fn new(set_index: u64, first_coding_index: u64, config: &ErasureConfig) -> ErasureMeta {
+    pub fn new(set_index: u64, config: ErasureConfig) -> ErasureMeta {
         ErasureMeta {
             set_index,
-            first_coding_index,
-            size: 0,
-            config: *config,
+            config,
+            ..Self::default()
         }
     }
 
     pub fn status(&self, index: &Index) -> ErasureMetaStatus {
         use ErasureMetaStatus::*;
 
-        let num_coding = index.coding().present_in_bounds(
-            self.first_coding_index..self.first_coding_index + self.config.num_coding() as u64,
-        );
+        let coding_indices = self.set_index..self.set_index + self.config.num_coding() as u64;
+        let num_coding = index.coding().present_in_bounds(coding_indices);
         let num_data = index
             .data()
             .present_in_bounds(self.set_index..self.set_index + self.config.num_data() as u64);
@@ -243,6 +273,18 @@ pub struct AddressSignatureMeta {
     pub writeable: bool,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct PerfSample {
+    pub num_transactions: u64,
+    pub num_slots: u64,
+    pub sample_period_secs: u16,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ProgramCost {
+    pub cost: u64,
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -256,7 +298,7 @@ mod test {
         let set_index = 0;
         let erasure_config = ErasureConfig::default();
 
-        let mut e_meta = ErasureMeta::new(set_index, set_index, &erasure_config);
+        let mut e_meta = ErasureMeta::new(set_index, erasure_config);
         let mut rng = thread_rng();
         let mut index = Index::new(0);
         e_meta.size = 1;

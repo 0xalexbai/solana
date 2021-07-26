@@ -34,8 +34,11 @@ jobs:
         - stable
       install:
         - source ci/rust-version.sh
+        - PATH="/usr/local/opt/coreutils/libexec/gnubin:$PATH"
+        - readlink -f .
       script:
         - source ci/env.sh
+        - rustup set profile default
         - ci/publish-tarball.sh
       deploy:
         - provider: s3
@@ -71,7 +74,7 @@ jobs:
 
       language: node_js
       node_js:
-        - "node"
+        - "lts/*"
 
       cache:
         directories:
@@ -124,6 +127,8 @@ jobs:
           - ~/.npm
 
       before_install:
+        - source ci/env.sh
+        - .travis/channel_restriction.sh edge beta || travis_terminate 0
         - .travis/affects.sh docs/ .travis || travis_terminate 0
         - cd docs/
         - source .travis/before_install.sh

@@ -1,27 +1,11 @@
 import React from "react";
-import bs58 from "bs58";
 import { TransactionInstruction } from "@solana/web3.js";
-import { Copyable } from "components/common/Copyable";
 import { Address } from "components/common/Address";
 
-function displayData(data: string) {
-  if (data.length > 50) {
-    return `${data.substring(0, 49)}…`;
-  }
-  return data;
-}
-
 export function RawDetails({ ix }: { ix: TransactionInstruction }) {
-  const data = bs58.encode(ix.data);
+  const data = ix.data.toString("hex");
   return (
     <>
-      <tr>
-        <td>Program</td>
-        <td className="text-lg-right">
-          <Address pubkey={ix.programId} alignRight link />
-        </td>
-      </tr>
-
       {ix.keys.map(({ pubkey, isSigner, isWritable }, keyIndex) => (
         <tr key={keyIndex}>
           <td>
@@ -40,11 +24,11 @@ export function RawDetails({ ix }: { ix: TransactionInstruction }) {
       ))}
 
       <tr>
-        <td>Instruction Data (Base58)</td>
+        <td>
+          Instruction Data <span className="text-muted">(Hex)</span>
+        </td>
         <td className="text-lg-right">
-          <Copyable text={data} right>
-            <code>{displayData(data)}</code>
-          </Copyable>
+          <pre className="d-inline-block text-left mb-0 data-wrap">{data}</pre>
         </td>
       </tr>
     </>

@@ -1,20 +1,28 @@
 //! Defines a Transaction type to package an atomic sequence of instructions.
 
+#![cfg(feature = "full")]
+
 use crate::sanitize::{Sanitize, SanitizeError};
+use crate::secp256k1_instruction::verify_eth_addresses;
 use crate::{
     hash::Hash,
     instruction::{CompiledInstruction, Instruction, InstructionError},
     message::Message,
+    program_utils::limited_deserialize,
     pubkey::Pubkey,
     short_vec,
     signature::{Signature, SignerError},
     signers::Signers,
+    system_instruction::SystemInstruction,
+    system_program,
 };
 use std::result;
 use thiserror::Error;
 
 /// Reasons a transaction might be rejected.
-#[derive(Error, Serialize, Deserialize, Debug, PartialEq, Eq, Clone, AbiExample, AbiEnumVisitor)]
+#[derive(
+    Error, Serialize, Deserialize, Debug, PartialEq, Eq, Clone, AbiExample, AbiEnumVisitor,
+)]
 pub enum TransactionError {
     /// An account is already being processed in another transaction in a way
     /// that does not support parallelism
@@ -42,11 +50,11 @@ pub enum TransactionError {
     #[error("This account may not be used to pay transaction fees")]
     InvalidAccountForFee,
 
-    /// The bank has seen this `Signature` before. This can occur under normal operation
+    /// The bank has seen this transaction before. This can occur under normal operation
     /// when a UDP packet is duplicated, as a user error from a client not updating
     /// its `recent_blockhash`, or as a double-spend attack.
-    #[error("The bank has seen this signature before")]
-    DuplicateSignature,
+    #[error("This transaction has already been processed")]
+    AlreadyProcessed,
 
     /// The bank has not seen the given `recent_blockhash` or the transaction is too old and
     /// the `recent_blockhash` has been discarded.
@@ -86,6 +94,10 @@ pub enum TransactionError {
 
     #[error("Transactions are currently disabled due to cluster maintenance")]
     ClusterMaintenance,
+
+    /// Transaction processing left an account with an outstanding borrowed reference
+    #[error("Transaction processing left an account with an outstanding borrowed reference")]
+    AccountBorrowOutstanding,
 }
 
 pub type Result<T> = result::Result<T, TransactionError>;
@@ -97,7 +109,7 @@ impl From<SanitizeError> for TransactionError {
 }
 
 /// An atomic transaction
-#[frozen_abi(digest = "GoxM5ZMMjM2FSuY1VtuMhs1j8u9kMuYsH3dpYcSVVnTe")]
+#[frozen_abi(digest = "AAeVxvWiiotwxDLxKLxsfgkA6ndW74nVbaAEb6cwJYqR")]
 #[derive(Debug, PartialEq, Default, Eq, Clone, Serialize, Deserialize, AbiExample)]
 pub struct Transaction {
     /// A set of digital signatures of `account_keys`, `program_ids`, `recent_blockhash`, and `instructions`, signed by the first
@@ -135,6 +147,11 @@ impl Transaction {
         Self::new_unsigned(message)
     }
 
+    /// Create a signed transaction with the given payer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when signing fails.
     pub fn new_signed_with_payer<T: Signers>(
         instructions: &[Instruction],
         payer: Option<&Pubkey>,
@@ -145,6 +162,11 @@ impl Transaction {
         Self::new(signing_keypairs, message, recent_blockhash)
     }
 
+    /// Create a signed transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics when signing fails.
     pub fn new<T: Signers>(
         from_keypairs: &T,
         message: Message,
@@ -162,6 +184,10 @@ impl Transaction {
     /// * `recent_blockhash` - The PoH hash.
     /// * `program_ids` - The keys that identify programs used in the `instruction` vector.
     /// * `instructions` - Instructions that will be executed atomically.
+    ///
+    /// # Panics
+    ///
+    /// Panics when signing fails.
     pub fn new_with_compiled_instructions<T: Signers>(
         from_keypairs: &T,
         keys: &[Pubkey],
@@ -222,6 +248,10 @@ impl Transaction {
     }
 
     /// Check keys and keypair lengths, then sign this transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics when signing fails, use [`Transaction::try_sign`] to handle the error.
     pub fn sign<T: Signers>(&mut self, keypairs: &T, recent_blockhash: Hash) {
         if let Err(e) = self.try_sign(keypairs, recent_blockhash) {
             panic!("Transaction::sign failed with error {:?}", e);
@@ -231,6 +261,10 @@ impl Transaction {
     /// Sign using some subset of required keys
     ///  if recent_blockhash is not the same as currently in the transaction,
     ///  clear any prior signatures and update recent_blockhash
+    ///
+    /// # Panics
+    ///
+    /// Panics when signing fails, use [`Transaction::try_partial_sign`] to handle the error.
     pub fn partial_sign<T: Signers>(&mut self, keypairs: &T, recent_blockhash: Hash) {
         if let Err(e) = self.try_partial_sign(keypairs, recent_blockhash) {
             panic!("Transaction::partial_sign failed with error {:?}", e);
@@ -239,6 +273,10 @@ impl Transaction {
 
     /// Sign the transaction and place the signatures in their associated positions in `signatures`
     /// without checking that the positions are correct.
+    ///
+    /// # Panics
+    ///
+    /// Panics when signing fails, use [`Transaction::try_partial_sign_unchecked`] to handle the error.
     pub fn partial_sign_unchecked<T: Signers>(
         &mut self,
         keypairs: &T,
@@ -309,18 +347,11 @@ impl Transaction {
         Ok(())
     }
 
-    pub fn verify_with_results(&self) -> Vec<bool> {
-        self.signatures
-            .iter()
-            .zip(&self.message.account_keys)
-            .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), &self.message_data()))
-            .collect()
-    }
-
     /// Verify the transaction
     pub fn verify(&self) -> Result<()> {
+        let message_bytes = self.message_data();
         if !self
-            .verify_with_results()
+            ._verify_with_results(&message_bytes)
             .iter()
             .all(|verify_result| *verify_result)
         {
@@ -328,6 +359,63 @@ impl Transaction {
         } else {
             Ok(())
         }
+    }
+
+    /// Verify the length of signatures matches the value in the message header
+    pub fn verify_signatures_len(&self) -> bool {
+        self.signatures.len() == self.message.header.num_required_signatures as usize
+    }
+
+    /// Verify the transaction and hash its message
+    pub fn verify_and_hash_message(&self) -> Result<Hash> {
+        let message_bytes = self.message_data();
+        if !self
+            ._verify_with_results(&message_bytes)
+            .iter()
+            .all(|verify_result| *verify_result)
+        {
+            Err(TransactionError::SignatureFailure)
+        } else {
+            Ok(Message::hash_raw_message(&message_bytes))
+        }
+    }
+
+    pub fn verify_with_results(&self) -> Vec<bool> {
+        self._verify_with_results(&self.message_data())
+    }
+
+    pub(crate) fn _verify_with_results(&self, message_bytes: &[u8]) -> Vec<bool> {
+        self.signatures
+            .iter()
+            .zip(&self.message.account_keys)
+            .map(|(signature, pubkey)| signature.verify(pubkey.as_ref(), message_bytes))
+            .collect()
+    }
+
+    pub fn verify_precompiles(&self, libsecp256k1_0_5_upgrade_enabled: bool) -> Result<()> {
+        for instruction in &self.message().instructions {
+            // The Transaction may not be sanitized at this point
+            if instruction.program_id_index as usize >= self.message().account_keys.len() {
+                return Err(TransactionError::AccountNotFound);
+            }
+            let program_id = &self.message().account_keys[instruction.program_id_index as usize];
+            if crate::secp256k1_program::check_id(program_id) {
+                let instruction_datas: Vec<_> = self
+                    .message()
+                    .instructions
+                    .iter()
+                    .map(|instruction| instruction.data.as_ref())
+                    .collect();
+                let data = &instruction.data;
+                let e = verify_eth_addresses(
+                    data,
+                    &instruction_datas,
+                    libsecp256k1_0_5_upgrade_enabled,
+                );
+                e.map_err(|_| TransactionError::InvalidAccountIndex)?;
+            }
+        }
+        Ok(())
     }
 
     /// Get the positions of the pubkeys in `account_keys` associated with signing keypairs
@@ -372,6 +460,31 @@ impl Transaction {
     }
 }
 
+pub fn uses_durable_nonce(tx: &Transaction) -> Option<&CompiledInstruction> {
+    let message = tx.message();
+    message
+        .instructions
+        .get(0)
+        .filter(|maybe_ix| {
+            let prog_id_idx = maybe_ix.program_id_index as usize;
+            match message.account_keys.get(prog_id_idx) {
+                Some(program_id) => system_program::check_id(program_id),
+                _ => false,
+            }
+        } && matches!(limited_deserialize(&maybe_ix.data), Ok(SystemInstruction::AdvanceNonceAccount))
+        )
+}
+
+pub fn get_nonce_pubkey_from_instruction<'a>(
+    ix: &CompiledInstruction,
+    tx: &'a Transaction,
+) -> Option<&'a Pubkey> {
+    ix.accounts.get(0).and_then(|idx| {
+        let idx = *idx as usize;
+        tx.message().account_keys.get(idx)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,10 +506,10 @@ mod tests {
     #[test]
     fn test_refs() {
         let key = Keypair::new();
-        let key1 = Pubkey::new_rand();
-        let key2 = Pubkey::new_rand();
-        let prog1 = Pubkey::new_rand();
-        let prog2 = Pubkey::new_rand();
+        let key1 = solana_sdk::pubkey::new_rand();
+        let key2 = solana_sdk::pubkey::new_rand();
+        let prog1 = solana_sdk::pubkey::new_rand();
+        let prog2 = solana_sdk::pubkey::new_rand();
         let instructions = vec![
             CompiledInstruction::new(3, &(), vec![0, 1]),
             CompiledInstruction::new(4, &(), vec![0, 2]),
@@ -463,8 +576,8 @@ mod tests {
     fn test_sanitize_txs() {
         let key = Keypair::new();
         let id0 = Pubkey::default();
-        let program_id = Pubkey::new_rand();
-        let ix = Instruction::new(
+        let program_id = solana_sdk::pubkey::new_rand();
+        let ix = Instruction::new_with_bincode(
             program_id,
             &0,
             vec![
@@ -541,7 +654,8 @@ mod tests {
             AccountMeta::new(keypair.pubkey(), true),
             AccountMeta::new(to, false),
         ];
-        let instruction = Instruction::new(program_id, &(1u8, 2u8, 3u8), account_metas);
+        let instruction =
+            Instruction::new_with_bincode(program_id, &(1u8, 2u8, 3u8), account_metas);
         let message = Message::new(&[instruction], Some(&keypair.pubkey()));
         Transaction::new(&[&keypair], message, Hash::default())
     }
@@ -559,7 +673,7 @@ mod tests {
     fn test_transaction_minimum_serialized_size() {
         let alice_keypair = Keypair::new();
         let alice_pubkey = alice_keypair.pubkey();
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
         let ix = system_instruction::transfer(&alice_pubkey, &bob_pubkey, 42);
 
         let expected_data_size = size_of::<u32>() + size_of::<u64>();
@@ -637,8 +751,8 @@ mod tests {
     #[should_panic]
     fn test_partial_sign_mismatched_key() {
         let keypair = Keypair::new();
-        let fee_payer = Pubkey::new_rand();
-        let ix = Instruction::new(
+        let fee_payer = solana_sdk::pubkey::new_rand();
+        let ix = Instruction::new_with_bincode(
             Pubkey::default(),
             &0,
             vec![AccountMeta::new(fee_payer, true)],
@@ -652,7 +766,7 @@ mod tests {
         let keypair0 = Keypair::new();
         let keypair1 = Keypair::new();
         let keypair2 = Keypair::new();
-        let ix = Instruction::new(
+        let ix = Instruction::new_with_bincode(
             Pubkey::default(),
             &0,
             vec![
@@ -682,7 +796,7 @@ mod tests {
         let program_id = Pubkey::default();
         let keypair0 = Keypair::new();
         let id0 = keypair0.pubkey();
-        let ix = Instruction::new(program_id, &0, vec![AccountMeta::new(id0, true)]);
+        let ix = Instruction::new_with_bincode(program_id, &0, vec![AccountMeta::new(id0, true)]);
         let message = Message::new(&[ix], Some(&id0));
         Transaction::new_unsigned(message).sign(&Vec::<&Keypair>::new(), Hash::default());
     }
@@ -693,7 +807,8 @@ mod tests {
         let program_id = Pubkey::default();
         let keypair0 = Keypair::new();
         let wrong_id = Pubkey::default();
-        let ix = Instruction::new(program_id, &0, vec![AccountMeta::new(wrong_id, true)]);
+        let ix =
+            Instruction::new_with_bincode(program_id, &0, vec![AccountMeta::new(wrong_id, true)]);
         let message = Message::new(&[ix], Some(&wrong_id));
         Transaction::new_unsigned(message).sign(&[&keypair0], Hash::default());
     }
@@ -703,7 +818,7 @@ mod tests {
         let program_id = Pubkey::default();
         let keypair0 = Keypair::new();
         let id0 = keypair0.pubkey();
-        let ix = Instruction::new(program_id, &0, vec![AccountMeta::new(id0, true)]);
+        let ix = Instruction::new_with_bincode(program_id, &0, vec![AccountMeta::new(id0, true)]);
         let message = Message::new(&[ix], Some(&id0));
         let mut tx = Transaction::new_unsigned(message);
         tx.sign(&[&keypair0], Hash::default());
@@ -719,8 +834,8 @@ mod tests {
         let program_id = Pubkey::default();
         let keypair0 = Keypair::new();
         let id0 = keypair0.pubkey();
-        let id1 = Pubkey::new_rand();
-        let ix = Instruction::new(
+        let id1 = solana_sdk::pubkey::new_rand();
+        let ix = Instruction::new_with_bincode(
             program_id,
             &0,
             vec![
@@ -748,7 +863,7 @@ mod tests {
         let presigner_keypair = Keypair::new();
         let presigner_pubkey = presigner_keypair.pubkey();
 
-        let ix = Instruction::new(
+        let ix = Instruction::new_with_bincode(
             program_id,
             &0,
             vec![
@@ -770,8 +885,8 @@ mod tests {
         assert_eq!(tx.signatures[1], presigner_sig);
 
         // Wrong key should error, not panic
-        let another_pubkey = Pubkey::new_rand();
-        let ix = Instruction::new(
+        let another_pubkey = solana_sdk::pubkey::new_rand();
+        let ix = Instruction::new_with_bincode(
             program_id,
             &0,
             vec![
@@ -788,5 +903,114 @@ mod tests {
             tx.signatures,
             vec![Signature::default(), Signature::default()]
         );
+    }
+
+    fn nonced_transfer_tx() -> (Pubkey, Pubkey, Transaction) {
+        let from_keypair = Keypair::new();
+        let from_pubkey = from_keypair.pubkey();
+        let nonce_keypair = Keypair::new();
+        let nonce_pubkey = nonce_keypair.pubkey();
+        let instructions = [
+            system_instruction::advance_nonce_account(&nonce_pubkey, &nonce_pubkey),
+            system_instruction::transfer(&from_pubkey, &nonce_pubkey, 42),
+        ];
+        let message = Message::new(&instructions, Some(&nonce_pubkey));
+        let tx = Transaction::new(&[&from_keypair, &nonce_keypair], message, Hash::default());
+        (from_pubkey, nonce_pubkey, tx)
+    }
+
+    #[test]
+    fn tx_uses_nonce_ok() {
+        let (_, _, tx) = nonced_transfer_tx();
+        assert!(uses_durable_nonce(&tx).is_some());
+    }
+
+    #[test]
+    fn tx_uses_nonce_empty_ix_fail() {
+        assert!(uses_durable_nonce(&Transaction::default()).is_none());
+    }
+
+    #[test]
+    fn tx_uses_nonce_bad_prog_id_idx_fail() {
+        let (_, _, mut tx) = nonced_transfer_tx();
+        tx.message.instructions.get_mut(0).unwrap().program_id_index = 255u8;
+        assert!(uses_durable_nonce(&tx).is_none());
+    }
+
+    #[test]
+    fn tx_uses_nonce_first_prog_id_not_nonce_fail() {
+        let from_keypair = Keypair::new();
+        let from_pubkey = from_keypair.pubkey();
+        let nonce_keypair = Keypair::new();
+        let nonce_pubkey = nonce_keypair.pubkey();
+        let instructions = [
+            system_instruction::transfer(&from_pubkey, &nonce_pubkey, 42),
+            system_instruction::advance_nonce_account(&nonce_pubkey, &nonce_pubkey),
+        ];
+        let message = Message::new(&instructions, Some(&from_pubkey));
+        let tx = Transaction::new(&[&from_keypair, &nonce_keypair], message, Hash::default());
+        assert!(uses_durable_nonce(&tx).is_none());
+    }
+
+    #[test]
+    fn tx_uses_nonce_wrong_first_nonce_ix_fail() {
+        let from_keypair = Keypair::new();
+        let from_pubkey = from_keypair.pubkey();
+        let nonce_keypair = Keypair::new();
+        let nonce_pubkey = nonce_keypair.pubkey();
+        let instructions = [
+            system_instruction::withdraw_nonce_account(
+                &nonce_pubkey,
+                &nonce_pubkey,
+                &from_pubkey,
+                42,
+            ),
+            system_instruction::transfer(&from_pubkey, &nonce_pubkey, 42),
+        ];
+        let message = Message::new(&instructions, Some(&nonce_pubkey));
+        let tx = Transaction::new(&[&from_keypair, &nonce_keypair], message, Hash::default());
+        assert!(uses_durable_nonce(&tx).is_none());
+    }
+
+    #[test]
+    fn get_nonce_pub_from_ix_ok() {
+        let (_, nonce_pubkey, tx) = nonced_transfer_tx();
+        let nonce_ix = uses_durable_nonce(&tx).unwrap();
+        assert_eq!(
+            get_nonce_pubkey_from_instruction(nonce_ix, &tx),
+            Some(&nonce_pubkey),
+        );
+    }
+
+    #[test]
+    fn get_nonce_pub_from_ix_no_accounts_fail() {
+        let (_, _, tx) = nonced_transfer_tx();
+        let nonce_ix = uses_durable_nonce(&tx).unwrap();
+        let mut nonce_ix = nonce_ix.clone();
+        nonce_ix.accounts.clear();
+        assert_eq!(get_nonce_pubkey_from_instruction(&nonce_ix, &tx), None,);
+    }
+
+    #[test]
+    fn get_nonce_pub_from_ix_bad_acc_idx_fail() {
+        let (_, _, tx) = nonced_transfer_tx();
+        let nonce_ix = uses_durable_nonce(&tx).unwrap();
+        let mut nonce_ix = nonce_ix.clone();
+        nonce_ix.accounts[0] = 255u8;
+        assert_eq!(get_nonce_pubkey_from_instruction(&nonce_ix, &tx), None,);
+    }
+
+    #[test]
+    fn tx_keypair_pubkey_mismatch() {
+        let from_keypair = Keypair::new();
+        let from_pubkey = from_keypair.pubkey();
+        let to_pubkey = Pubkey::new_unique();
+        let instructions = [system_instruction::transfer(&from_pubkey, &to_pubkey, 42)];
+        let mut tx = Transaction::new_with_payer(&instructions, Some(&from_pubkey));
+        let unused_keypair = Keypair::new();
+        let err = tx
+            .try_partial_sign(&[&from_keypair, &unused_keypair], Hash::default())
+            .unwrap_err();
+        assert_eq!(err, SignerError::KeypairPubkeyMismatch);
     }
 }

@@ -1,13 +1,15 @@
-use crate::keypair::{parse_keypair_path, KeypairUrl, ASK_KEYWORD};
-use chrono::DateTime;
-use solana_sdk::{
-    clock::Slot,
-    hash::Hash,
-    pubkey::Pubkey,
-    signature::{read_keypair_file, Signature},
+use {
+    crate::keypair::{parse_signer_source, SignerSourceKind, ASK_KEYWORD},
+    chrono::DateTime,
+    solana_sdk::{
+        clock::{Epoch, Slot},
+        hash::Hash,
+        pubkey::{Pubkey, MAX_SEED_LEN},
+        signature::{read_keypair_file, Signature},
+    },
+    std::fmt::Display,
+    std::str::FromStr,
 };
-use std::fmt::Display;
-use std::str::FromStr;
 
 fn is_parsable_generic<U, T>(string: T) -> Result<(), String>
 where
@@ -30,6 +32,29 @@ where
     T::Err: Display,
 {
     is_parsable_generic::<T, String>(string)
+}
+
+// Return an error if string cannot be parsed as numeric type T, and value not within specified
+// range
+pub fn is_within_range<T>(string: String, range_min: T, range_max: T) -> Result<(), String>
+where
+    T: FromStr + Copy + std::fmt::Debug + PartialOrd + std::ops::Add<Output = T> + From<usize>,
+    T::Err: Display,
+{
+    match string.parse::<T>() {
+        Ok(input) => {
+            let range = range_min..range_max + 1.into();
+            if !range.contains(&input) {
+                Err(format!(
+                    "input '{:?}' out of range ({:?}..{:?}]",
+                    input, range_min, range_max
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        Err(err) => Err(format!("error parsing '{}': {}", string, err)),
+    }
 }
 
 // Return an error if a pubkey cannot be parsed.
@@ -71,6 +96,26 @@ where
         .map_err(|err| format!("{}", err))
 }
 
+// Return an error if a `SignerSourceKind::Prompt` cannot be parsed
+pub fn is_prompt_signer_source<T>(string: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    if string.as_ref() == ASK_KEYWORD {
+        return Ok(());
+    }
+    match parse_signer_source(string.as_ref())
+        .map_err(|err| format!("{}", err))?
+        .kind
+    {
+        SignerSourceKind::Prompt => Ok(()),
+        _ => Err(format!(
+            "Unable to parse input as `prompt:` URI scheme or `ASK` keyword: {}",
+            string
+        )),
+    }
+}
+
 // Return an error if string cannot be parsed as pubkey string or keypair file location
 pub fn is_pubkey_or_keypair<T>(string: T) -> Result<(), String>
 where
@@ -85,8 +130,11 @@ pub fn is_valid_pubkey<T>(string: T) -> Result<(), String>
 where
     T: AsRef<str> + Display,
 {
-    match parse_keypair_path(string.as_ref()) {
-        KeypairUrl::Filepath(path) => is_keypair(path),
+    match parse_signer_source(string.as_ref())
+        .map_err(|err| format!("{}", err))?
+        .kind
+    {
+        SignerSourceKind::Filepath(path) => is_keypair(path),
         _ => Ok(()),
     }
 }
@@ -146,6 +194,40 @@ where
         }
         Err(err) => Err(format!("{}", err)),
     }
+}
+
+pub fn is_url_or_moniker<T>(string: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    match url::Url::parse(&normalize_to_url_if_moniker(string.as_ref())) {
+        Ok(url) => {
+            if url.has_host() {
+                Ok(())
+            } else {
+                Err("no host provided".to_string())
+            }
+        }
+        Err(err) => Err(format!("{}", err)),
+    }
+}
+
+pub fn normalize_to_url_if_moniker<T: AsRef<str>>(url_or_moniker: T) -> String {
+    match url_or_moniker.as_ref() {
+        "m" | "mainnet-beta" => "https://api.mainnet-beta.solana.com",
+        "t" | "testnet" => "https://api.testnet.solana.com",
+        "d" | "devnet" => "https://api.devnet.solana.com",
+        "l" | "localhost" => "http://localhost:8899",
+        url => url,
+    }
+    .to_string()
+}
+
+pub fn is_epoch<T>(epoch: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    is_parsable_generic::<Epoch, _>(epoch)
 }
 
 pub fn is_slot<T>(slot: T) -> Result<(), String>
@@ -255,6 +337,21 @@ where
             }
         })
         .map(|_| ())
+}
+
+pub fn is_derived_address_seed<T>(value: T) -> Result<(), String>
+where
+    T: AsRef<str> + Display,
+{
+    let value = value.as_ref();
+    if value.len() > MAX_SEED_LEN {
+        Err(format!(
+            "Address seed must not be longer than {} bytes",
+            MAX_SEED_LEN
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

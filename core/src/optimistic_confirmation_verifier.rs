@@ -20,7 +20,7 @@ impl OptimisticConfirmationVerifier {
     }
 
     // Returns any optimistic slots that were not rooted
-    pub fn get_unrooted_optimistic_slots(
+    pub fn verify_for_unrooted_optimistic_slots(
         &mut self,
         root_bank: &Bank,
         blockstore: &Blockstore,
@@ -34,9 +34,9 @@ impl OptimisticConfirmationVerifier {
         std::mem::swap(&mut slots_before_root, &mut self.unchecked_slots);
         slots_before_root
             .into_iter()
-            .filter(|(optimistic_slot, hash)| {
-                (*optimistic_slot == root && *hash != root_bank.hash())
-                    || (!root_ancestors.contains_key(&optimistic_slot) &&
+            .filter(|(optimistic_slot, optimistic_hash)| {
+                (*optimistic_slot == root && *optimistic_hash != root_bank.hash())
+                    || (!root_ancestors.contains_key(optimistic_slot) &&
                     // In this second part of the `and`, we account for the possibility that
                     // there was some other root `rootX` set in BankForks where:
                     //
@@ -76,6 +76,10 @@ impl OptimisticConfirmationVerifier {
         self.last_optimistic_slot_ts = Instant::now();
     }
 
+    pub fn format_optimistic_confirmed_slot_violation_log(slot: Slot) -> String {
+        format!("Optimistically confirmed slot {} was not rooted", slot)
+    }
+
     pub fn log_unrooted_optimistic_slots(
         root_bank: &Bank,
         vote_tracker: &VoteTracker,
@@ -96,7 +100,7 @@ impl OptimisticConfirmationVerifier {
                     .unwrap_or(0);
 
                 error!(
-                    "Optimistic slot {} was not rooted,
+                    "{},
                     hash: {},
                     epoch: {},
                     voted keys: {:?},
@@ -105,7 +109,7 @@ impl OptimisticConfirmationVerifier {
                     voted stake: {},
                     total epoch stake: {},
                     pct: {}",
-                    optimistic_slot,
+                    Self::format_optimistic_confirmed_slot_violation_log(*optimistic_slot),
                     hash,
                     epoch,
                     r_slot_tracker
@@ -136,7 +140,7 @@ impl OptimisticConfirmationVerifier {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::consensus::test::VoteSimulator;
+    use crate::vote_simulator::VoteSimulator;
     use solana_ledger::get_tmp_ledger_path;
     use solana_runtime::bank::Bank;
     use solana_sdk::pubkey::Pubkey;
@@ -181,7 +185,8 @@ mod test {
                 .cloned()
                 .unwrap();
             assert_eq!(
-                optimistic_confirmation_verifier.get_unrooted_optimistic_slots(&bank1, &blockstore),
+                optimistic_confirmation_verifier
+                    .verify_for_unrooted_optimistic_slots(&bank1, &blockstore),
                 vec![(1, bad_bank_hash)]
             );
             assert_eq!(optimistic_confirmation_verifier.unchecked_slots.len(), 1);
@@ -228,7 +233,7 @@ mod test {
                 .cloned()
                 .unwrap();
             assert!(optimistic_confirmation_verifier
-                .get_unrooted_optimistic_slots(&bank5, &blockstore)
+                .verify_for_unrooted_optimistic_slots(&bank5, &blockstore)
                 .is_empty());
             // 5 is >= than all the unchecked slots, so should clear everything
             assert!(optimistic_confirmation_verifier.unchecked_slots.is_empty());
@@ -244,7 +249,7 @@ mod test {
                 .cloned()
                 .unwrap();
             assert!(optimistic_confirmation_verifier
-                .get_unrooted_optimistic_slots(&bank3, &blockstore)
+                .verify_for_unrooted_optimistic_slots(&bank3, &blockstore)
                 .is_empty());
             // 3 is bigger than only slot 1, so slot 5 should be left over
             assert_eq!(optimistic_confirmation_verifier.unchecked_slots.len(), 1);
@@ -264,7 +269,8 @@ mod test {
                 .cloned()
                 .unwrap();
             assert_eq!(
-                optimistic_confirmation_verifier.get_unrooted_optimistic_slots(&bank4, &blockstore),
+                optimistic_confirmation_verifier
+                    .verify_for_unrooted_optimistic_slots(&bank4, &blockstore),
                 vec![optimistic_slots[1]]
             );
             // 4 is bigger than only slots 1 and 3, so slot 5 should be left over
@@ -303,16 +309,17 @@ mod test {
             optimistic_confirmation_verifier
                 .add_new_optimistic_confirmed_slots(optimistic_slots.clone());
             assert_eq!(
-                optimistic_confirmation_verifier.get_unrooted_optimistic_slots(&bank7, &blockstore),
+                optimistic_confirmation_verifier
+                    .verify_for_unrooted_optimistic_slots(&bank7, &blockstore),
                 optimistic_slots[0..=1].to_vec()
             );
             assert!(optimistic_confirmation_verifier.unchecked_slots.is_empty());
 
             // If we know set the root in blockstore, should return nothing
-            blockstore.set_roots(&[1, 3]).unwrap();
+            blockstore.set_roots(vec![1, 3].iter()).unwrap();
             optimistic_confirmation_verifier.add_new_optimistic_confirmed_slots(optimistic_slots);
             assert!(optimistic_confirmation_verifier
-                .get_unrooted_optimistic_slots(&bank7, &blockstore)
+                .verify_for_unrooted_optimistic_slots(&bank7, &blockstore)
                 .is_empty());
             assert!(optimistic_confirmation_verifier.unchecked_slots.is_empty());
         }

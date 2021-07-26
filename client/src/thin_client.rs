@@ -3,36 +3,38 @@
 //! messages to the network directly. The binary encoding of its messages are
 //! unstable and may change in future releases.
 
-use crate::{rpc_client::RpcClient, rpc_response::Response};
-use bincode::{serialize_into, serialized_size};
-use log::*;
-use solana_sdk::{
-    account::Account,
-    client::{AsyncClient, Client, SyncClient},
-    clock::{Slot, MAX_PROCESSING_AGE},
-    commitment_config::CommitmentConfig,
-    epoch_info::EpochInfo,
-    fee_calculator::{FeeCalculator, FeeRateGovernor},
-    hash::Hash,
-    instruction::Instruction,
-    message::Message,
-    packet::PACKET_DATA_SIZE,
-    pubkey::Pubkey,
-    signature::{Keypair, Signature, Signer},
-    signers::Signers,
-    system_instruction,
-    timing::duration_as_ms,
-    transaction::{self, Transaction},
-    transport::Result as TransportResult,
-};
-use std::{
-    io,
-    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
-    sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        RwLock,
+use {
+    crate::{rpc_client::RpcClient, rpc_config::RpcProgramAccountsConfig, rpc_response::Response},
+    bincode::{serialize_into, serialized_size},
+    log::*,
+    solana_sdk::{
+        account::Account,
+        client::{AsyncClient, Client, SyncClient},
+        clock::{Slot, MAX_PROCESSING_AGE},
+        commitment_config::CommitmentConfig,
+        epoch_info::EpochInfo,
+        fee_calculator::{FeeCalculator, FeeRateGovernor},
+        hash::Hash,
+        instruction::Instruction,
+        message::Message,
+        packet::PACKET_DATA_SIZE,
+        pubkey::Pubkey,
+        signature::{Keypair, Signature, Signer},
+        signers::Signers,
+        system_instruction,
+        timing::duration_as_ms,
+        transaction::{self, Transaction},
+        transport::Result as TransportResult,
     },
-    time::{Duration, Instant},
+    std::{
+        io,
+        net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            RwLock,
+        },
+        time::{Duration, Instant},
+    },
 };
 
 struct ClientOptimizer {
@@ -167,8 +169,8 @@ impl ThinClient {
         let rpc_clients: Vec<_> = rpc_addrs.into_iter().map(RpcClient::new_socket).collect();
         let optimizer = ClientOptimizer::new(rpc_clients.len());
         Self {
-            tpu_addrs,
             transactions_socket,
+            tpu_addrs,
             rpc_clients,
             optimizer,
         }
@@ -276,6 +278,16 @@ impl ThinClient {
         )
     }
 
+    pub fn get_program_accounts_with_config(
+        &self,
+        pubkey: &Pubkey,
+        config: RpcProgramAccountsConfig,
+    ) -> TransportResult<Vec<(Pubkey, Account)>> {
+        self.rpc_client()
+            .get_program_accounts_with_config(pubkey, config)
+            .map_err(|e| e.into())
+    }
+
     pub fn wait_for_balance_with_commitment(
         &self,
         pubkey: &Pubkey,
@@ -297,10 +309,6 @@ impl ThinClient {
         self.rpc_client()
             .poll_for_signature_with_commitment(signature, commitment_config)
             .map_err(|e| e.into())
-    }
-
-    pub fn validator_exit(&self) -> TransportResult<bool> {
-        self.rpc_client().validator_exit().map_err(|e| e.into())
     }
 
     pub fn get_num_blocks_since_signature_confirmation(
@@ -389,6 +397,12 @@ impl SyncClient for ThinClient {
             .map(|r| r.value)
     }
 
+    fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> TransportResult<u64> {
+        self.rpc_client()
+            .get_minimum_balance_for_rent_exemption(data_len)
+            .map_err(|e| e.into())
+    }
+
     fn get_recent_blockhash(&self) -> TransportResult<(Hash, FeeCalculator)> {
         let (blockhash, fee_calculator, _last_valid_slot) =
             self.get_recent_blockhash_with_commitment(CommitmentConfig::default())?;
@@ -437,7 +451,7 @@ impl SyncClient for ThinClient {
     ) -> TransportResult<Option<transaction::Result<()>>> {
         let status = self
             .rpc_client()
-            .get_signature_status(&signature)
+            .get_signature_status(signature)
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::Other,
@@ -454,7 +468,7 @@ impl SyncClient for ThinClient {
     ) -> TransportResult<Option<transaction::Result<()>>> {
         let status = self
             .rpc_client()
-            .get_signature_status_with_commitment(&signature, commitment_config)
+            .get_signature_status_with_commitment(signature, commitment_config)
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::Other,

@@ -1,11 +1,19 @@
 // Primitives for reading/writing BigTable tables
 
-use crate::access_token::{AccessToken, Scope};
-use crate::compression::{compress_best, decompress};
-use crate::root_ca_certificate;
-use log::*;
-use thiserror::Error;
-use tonic::{metadata::MetadataValue, transport::ClientTlsConfig, Request};
+use {
+    crate::{
+        access_token::{AccessToken, Scope},
+        compression::{compress_best, decompress},
+        root_ca_certificate,
+    },
+    log::*,
+    std::time::{Duration, Instant},
+    thiserror::Error,
+    tonic::{
+        codegen::InterceptedService, metadata::MetadataValue, transport::ClientTlsConfig, Request,
+        Status,
+    },
+};
 
 mod google {
     mod rpc {
@@ -26,24 +34,28 @@ mod google {
 use google::bigtable::v2::*;
 
 pub type RowKey = String;
-pub type CellName = String;
-pub type CellValue = Vec<u8>;
 pub type RowData = Vec<(CellName, CellValue)>;
 pub type RowDataSlice<'a> = &'a [(CellName, CellValue)];
+pub type CellName = String;
+pub type CellValue = Vec<u8>;
+pub enum CellData<B, P> {
+    Bincode(B),
+    Protobuf(P),
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("AccessToken error: {0}")]
-    AccessTokenError(String),
+    #[error("AccessToken: {0}")]
+    AccessToken(String),
 
-    #[error("Certificate error: {0}")]
-    CertificateError(String),
+    #[error("Certificate: {0}")]
+    Certificate(String),
 
-    #[error("I/O Error: {0}")]
-    IoError(std::io::Error),
+    #[error("I/O: {0}")]
+    Io(std::io::Error),
 
-    #[error("Transport error: {0}")]
-    TransportError(tonic::transport::Error),
+    #[error("Transport: {0}")]
+    Transport(tonic::transport::Error),
 
     #[error("Invalid URI {0}: {1}")]
     InvalidUri(String, String),
@@ -60,35 +72,40 @@ pub enum Error {
     #[error("Object is corrupt: {0}")]
     ObjectCorrupt(String),
 
-    #[error("RPC error: {0}")]
-    RpcError(tonic::Status),
+    #[error("RPC: {0}")]
+    Rpc(tonic::Status),
+
+    #[error("Timeout")]
+    Timeout,
 }
 
 impl std::convert::From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        Self::IoError(err)
+        Self::Io(err)
     }
 }
 
 impl std::convert::From<tonic::transport::Error> for Error {
     fn from(err: tonic::transport::Error) -> Self {
-        Self::TransportError(err)
+        Self::Transport(err)
     }
 }
 
 impl std::convert::From<tonic::Status> for Error {
     fn from(err: tonic::Status) -> Self {
-        Self::RpcError(err)
+        Self::Rpc(err)
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+type InterceptedRequestResult = std::result::Result<Request<()>, Status>;
 
 #[derive(Clone)]
 pub struct BigTableConnection {
     access_token: Option<AccessToken>,
     channel: tonic::transport::Channel,
     table_prefix: String,
+    timeout: Option<Duration>,
 }
 
 impl BigTableConnection {
@@ -100,7 +117,11 @@ impl BigTableConnection {
     ///
     /// The BIGTABLE_EMULATOR_HOST environment variable is also respected.
     ///
-    pub async fn new(instance_name: &str, read_only: bool) -> Result<Self> {
+    pub async fn new(
+        instance_name: &str,
+        read_only: bool,
+        timeout: Option<Duration>,
+    ) -> Result<Self> {
         match std::env::var("BIGTABLE_EMULATOR_HOST") {
             Ok(endpoint) => {
                 info!("Connecting to bigtable emulator at {}", endpoint);
@@ -111,6 +132,7 @@ impl BigTableConnection {
                         .map_err(|err| Error::InvalidUri(endpoint, err.to_string()))?
                         .connect_lazy()?,
                     table_prefix: format!("projects/emulator/instances/{}/tables/", instance_name),
+                    timeout,
                 })
             }
 
@@ -121,7 +143,7 @@ impl BigTableConnection {
                     Scope::BigTableData
                 })
                 .await
-                .map_err(Error::AccessTokenError)?;
+                .map_err(Error::AccessToken)?;
 
                 let table_prefix = format!(
                     "projects/{}/instances/{}/tables/",
@@ -129,20 +151,29 @@ impl BigTableConnection {
                     instance_name
                 );
 
+                let endpoint = {
+                    let endpoint =
+                        tonic::transport::Channel::from_static("https://bigtable.googleapis.com")
+                            .tls_config(
+                            ClientTlsConfig::new()
+                                .ca_certificate(
+                                    root_ca_certificate::load().map_err(Error::Certificate)?,
+                                )
+                                .domain_name("bigtable.googleapis.com"),
+                        )?;
+
+                    if let Some(timeout) = timeout {
+                        endpoint.timeout(timeout)
+                    } else {
+                        endpoint
+                    }
+                };
+
                 Ok(Self {
                     access_token: Some(access_token),
-                    channel: tonic::transport::Channel::from_static(
-                        "https://bigtable.googleapis.com",
-                    )
-                    .tls_config(
-                        ClientTlsConfig::new()
-                            .ca_certificate(
-                                root_ca_certificate::load().map_err(Error::CertificateError)?,
-                            )
-                            .domain_name("bigtable.googleapis.com"),
-                    )?
-                    .connect_lazy()?,
+                    channel: endpoint.connect_lazy()?,
                     table_prefix,
+                    timeout,
                 })
             }
         }
@@ -152,12 +183,12 @@ impl BigTableConnection {
     ///
     /// Clients require `&mut self`, due to `Tonic::transport::Channel` limitations, however
     /// creating new clients is cheap and thus can be used as a work around for ease of use.
-    pub fn client(&self) -> BigTable {
-        let client = if let Some(access_token) = &self.access_token {
-            let access_token = access_token.clone();
-            bigtable_client::BigtableClient::with_interceptor(
-                self.channel.clone(),
-                move |mut req: Request<()>| {
+    pub fn client(&self) -> BigTable<impl FnMut(Request<()>) -> InterceptedRequestResult> {
+        let access_token = self.access_token.clone();
+        let client = bigtable_client::BigtableClient::with_interceptor(
+            self.channel.clone(),
+            move |mut req: Request<()>| {
+                if let Some(access_token) = &access_token {
                     match MetadataValue::from_str(&access_token.get()) {
                         Ok(authorization_header) => {
                             req.metadata_mut()
@@ -167,16 +198,15 @@ impl BigTableConnection {
                             warn!("Failed to set authorization header: {}", err);
                         }
                     }
-                    Ok(req)
-                },
-            )
-        } else {
-            bigtable_client::BigtableClient::new(self.channel.clone())
-        };
+                }
+                Ok(req)
+            },
+        );
         BigTable {
             access_token: self.access_token.clone(),
             client,
             table_prefix: self.table_prefix.clone(),
+            timeout: self.timeout,
         }
     }
 
@@ -188,24 +218,41 @@ impl BigTableConnection {
     where
         T: serde::ser::Serialize,
     {
-        use backoff::{future::FutureOperation as _, ExponentialBackoff};
-        (|| async {
+        use backoff::{future::retry, ExponentialBackoff};
+        retry(ExponentialBackoff::default(), || async {
             let mut client = self.client();
             Ok(client.put_bincode_cells(table, cells).await?)
         })
-        .retry(ExponentialBackoff::default())
+        .await
+    }
+
+    pub async fn put_protobuf_cells_with_retry<T>(
+        &self,
+        table: &str,
+        cells: &[(RowKey, T)],
+    ) -> Result<usize>
+    where
+        T: prost::Message,
+    {
+        use backoff::{future::retry, ExponentialBackoff};
+        retry(ExponentialBackoff::default(), || async {
+            let mut client = self.client();
+            Ok(client.put_protobuf_cells(table, cells).await?)
+        })
         .await
     }
 }
 
-pub struct BigTable {
+pub struct BigTable<F: FnMut(Request<()>) -> InterceptedRequestResult> {
     access_token: Option<AccessToken>,
-    client: bigtable_client::BigtableClient<tonic::transport::Channel>,
+    client: bigtable_client::BigtableClient<InterceptedService<tonic::transport::Channel, F>>,
     table_prefix: String,
+    timeout: Option<Duration>,
 }
 
-impl BigTable {
+impl<F: FnMut(Request<()>) -> InterceptedRequestResult> BigTable<F> {
     async fn decode_read_rows_response(
+        &self,
         mut rrr: tonic::codec::Streaming<ReadRowsResponse>,
     ) -> Result<Vec<(RowKey, RowData)>> {
         let mut rows: Vec<(RowKey, RowData)> = vec![];
@@ -217,7 +264,14 @@ impl BigTable {
         let mut cell_timestamp = 0;
         let mut cell_value = vec![];
         let mut cell_version_ok = true;
+        let started = Instant::now();
+
         while let Some(res) = rrr.message().await? {
+            if let Some(timeout) = self.timeout {
+                if Instant::now().duration_since(started) > timeout {
+                    return Err(Error::Timeout);
+                }
+            }
             for (i, mut chunk) in res.chunks.into_iter().enumerate() {
                 // The comments for `read_rows_response::CellChunk` provide essential details for
                 // understanding how the below decoding works...
@@ -290,7 +344,8 @@ impl BigTable {
     /// Otherwise the listing will start from the start of the table.
     ///
     /// If `end_at` is provided, the row key listing will end at the key. Otherwise it will
-    /// continue until the `limit` is reached or the end of the table, whichever comes first.
+    /// continue until the `rows_limit` is reached or the end of the table, whichever comes first.
+    /// If `rows_limit` is zero, the listing will continue until the end of the table.
     pub async fn get_row_keys(
         &mut self,
         table_name: &str,
@@ -337,7 +392,7 @@ impl BigTable {
             .await?
             .into_inner();
 
-        let rows = Self::decode_read_rows_response(response).await?;
+        let rows = self.decode_read_rows_response(response).await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
@@ -346,11 +401,13 @@ impl BigTable {
     /// All column families are accepted, and only the latest version of each column cell will be
     /// returned.
     ///
-    /// If `start_at` is provided, the row key listing will start with key.
-    /// Otherwise the listing will start from the start of the table.
+    /// If `start_at` is provided, the row key listing will start with key, or the next key in the
+    /// table if the explicit key does not exist. Otherwise the listing will start from the start
+    /// of the table.
     ///
     /// If `end_at` is provided, the row key listing will end at the key. Otherwise it will
-    /// continue until the `limit` is reached or the end of the table, whichever comes first.
+    /// continue until the `rows_limit` is reached or the end of the table, whichever comes first.
+    /// If `rows_limit` is zero, the listing will continue until the end of the table.
     pub async fn get_row_data(
         &mut self,
         table_name: &str,
@@ -384,7 +441,44 @@ impl BigTable {
             .await?
             .into_inner();
 
-        Self::decode_read_rows_response(response).await
+        self.decode_read_rows_response(response).await
+    }
+
+    /// Get latest data from a single row of `table`, if that row exists. Returns an error if that
+    /// row does not exist.
+    ///
+    /// All column families are accepted, and only the latest version of each column cell will be
+    /// returned.
+    pub async fn get_single_row_data(
+        &mut self,
+        table_name: &str,
+        row_key: RowKey,
+    ) -> Result<RowData> {
+        self.refresh_access_token().await;
+
+        let response = self
+            .client
+            .read_rows(ReadRowsRequest {
+                table_name: format!("{}{}", self.table_prefix, table_name),
+                rows_limit: 1,
+                rows: Some(RowSet {
+                    row_keys: vec![row_key.into_bytes()],
+                    row_ranges: vec![],
+                }),
+                filter: Some(RowFilter {
+                    // Only return the latest version of each cell
+                    filter: Some(row_filter::Filter::CellsPerColumnLimitFilter(1)),
+                }),
+                ..ReadRowsRequest::default()
+            })
+            .await?
+            .into_inner();
+
+        let rows = self.decode_read_rows_response(response).await?;
+        rows.into_iter()
+            .next()
+            .map(|r| r.1)
+            .ok_or(Error::RowNotFound)
     }
 
     /// Store data for one or more `table` rows in the `family_name` Column family
@@ -445,10 +539,21 @@ impl BigTable {
     where
         T: serde::de::DeserializeOwned,
     {
-        let row_data = self.get_row_data(table, Some(key.clone()), None, 1).await?;
-        let (row_key, data) = &row_data.get(0).ok_or_else(|| Error::RowNotFound)?;
+        let row_data = self.get_single_row_data(table, key.clone()).await?;
+        deserialize_bincode_cell_data(&row_data, table, key.to_string())
+    }
 
-        deserialize_cell_data(data, table, row_key.to_string())
+    pub async fn get_protobuf_or_bincode_cell<B, P>(
+        &mut self,
+        table: &str,
+        key: RowKey,
+    ) -> Result<CellData<B, P>>
+    where
+        B: serde::de::DeserializeOwned,
+        P: prost::Message + Default,
+    {
+        let row_data = self.get_single_row_data(table, key.clone()).await?;
+        deserialize_protobuf_or_bincode_cell_data(&row_data, table, key)
     }
 
     pub async fn put_bincode_cells<T>(
@@ -470,9 +575,71 @@ impl BigTable {
         self.put_row_data(table, "x", &new_row_data).await?;
         Ok(bytes_written)
     }
+
+    pub async fn put_protobuf_cells<T>(
+        &mut self,
+        table: &str,
+        cells: &[(RowKey, T)],
+    ) -> Result<usize>
+    where
+        T: prost::Message,
+    {
+        let mut bytes_written = 0;
+        let mut new_row_data = vec![];
+        for (row_key, data) in cells {
+            let mut buf = Vec::with_capacity(data.encoded_len());
+            data.encode(&mut buf).unwrap();
+            let data = compress_best(&buf)?;
+            bytes_written += data.len();
+            new_row_data.push((row_key, vec![("proto".to_string(), data)]));
+        }
+
+        self.put_row_data(table, "x", &new_row_data).await?;
+        Ok(bytes_written)
+    }
 }
 
-pub(crate) fn deserialize_cell_data<T>(
+pub(crate) fn deserialize_protobuf_or_bincode_cell_data<B, P>(
+    row_data: RowDataSlice,
+    table: &str,
+    key: RowKey,
+) -> Result<CellData<B, P>>
+where
+    B: serde::de::DeserializeOwned,
+    P: prost::Message + Default,
+{
+    match deserialize_protobuf_cell_data(row_data, table, key.to_string()) {
+        Ok(result) => return Ok(CellData::Protobuf(result)),
+        Err(err) => match err {
+            Error::ObjectNotFound(_) => {}
+            _ => return Err(err),
+        },
+    }
+    deserialize_bincode_cell_data(row_data, table, key).map(CellData::Bincode)
+}
+
+pub(crate) fn deserialize_protobuf_cell_data<T>(
+    row_data: RowDataSlice,
+    table: &str,
+    key: RowKey,
+) -> Result<T>
+where
+    T: prost::Message + Default,
+{
+    let value = &row_data
+        .iter()
+        .find(|(name, _)| name == "proto")
+        .ok_or_else(|| Error::ObjectNotFound(format!("{}/{}", table, key)))?
+        .1;
+
+    let data = decompress(value)?;
+    T::decode(&data[..]).map_err(|err| {
+        warn!("Failed to deserialize {}/{}: {}", table, key, err);
+        Error::ObjectCorrupt(format!("{}/{}", table, key))
+    })
+}
+
+pub(crate) fn deserialize_bincode_cell_data<T>(
     row_data: RowDataSlice,
     table: &str,
     key: RowKey,
@@ -486,9 +653,127 @@ where
         .ok_or_else(|| Error::ObjectNotFound(format!("{}/{}", table, key)))?
         .1;
 
-    let data = decompress(&value)?;
+    let data = decompress(value)?;
     bincode::deserialize(&data).map_err(|err| {
         warn!("Failed to deserialize {}/{}: {}", table, key, err);
         Error::ObjectCorrupt(format!("{}/{}", table, key))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::StoredConfirmedBlock;
+    use prost::Message;
+    use solana_sdk::{hash::Hash, signature::Keypair, system_transaction};
+    use solana_storage_proto::convert::generated;
+    use solana_transaction_status::{
+        ConfirmedBlock, TransactionStatusMeta, TransactionWithStatusMeta,
+    };
+    use std::convert::TryInto;
+
+    #[test]
+    fn test_deserialize_protobuf_or_bincode_cell_data() {
+        let from = Keypair::new();
+        let recipient = solana_sdk::pubkey::new_rand();
+        let transaction = system_transaction::transfer(&from, &recipient, 42, Hash::default());
+        let with_meta = TransactionWithStatusMeta {
+            transaction,
+            meta: Some(TransactionStatusMeta {
+                status: Ok(()),
+                fee: 1,
+                pre_balances: vec![43, 0, 1],
+                post_balances: vec![0, 42, 1],
+                inner_instructions: Some(vec![]),
+                log_messages: Some(vec![]),
+                pre_token_balances: Some(vec![]),
+                post_token_balances: Some(vec![]),
+                rewards: Some(vec![]),
+            }),
+        };
+        let block = ConfirmedBlock {
+            transactions: vec![with_meta],
+            parent_slot: 1,
+            blockhash: Hash::default().to_string(),
+            previous_blockhash: Hash::default().to_string(),
+            rewards: vec![],
+            block_time: Some(1_234_567_890),
+            block_height: Some(1),
+        };
+        let bincode_block = compress_best(
+            &bincode::serialize::<StoredConfirmedBlock>(&block.clone().into()).unwrap(),
+        )
+        .unwrap();
+
+        let protobuf_block = generated::ConfirmedBlock::from(block.clone());
+        let mut buf = Vec::with_capacity(protobuf_block.encoded_len());
+        protobuf_block.encode(&mut buf).unwrap();
+        let protobuf_block = compress_best(&buf).unwrap();
+
+        let deserialized = deserialize_protobuf_or_bincode_cell_data::<
+            StoredConfirmedBlock,
+            generated::ConfirmedBlock,
+        >(
+            &[("proto".to_string(), protobuf_block.clone())],
+            "",
+            "".to_string(),
+        )
+        .unwrap();
+        if let CellData::Protobuf(protobuf_block) = deserialized {
+            assert_eq!(block, protobuf_block.try_into().unwrap());
+        } else {
+            panic!("deserialization should produce CellData::Protobuf");
+        }
+
+        let deserialized = deserialize_protobuf_or_bincode_cell_data::<
+            StoredConfirmedBlock,
+            generated::ConfirmedBlock,
+        >(
+            &[("bin".to_string(), bincode_block.clone())],
+            "",
+            "".to_string(),
+        )
+        .unwrap();
+        if let CellData::Bincode(bincode_block) = deserialized {
+            let mut block = block;
+            if let Some(meta) = &mut block.transactions[0].meta {
+                meta.inner_instructions = None; // Legacy bincode implementation does not support inner_instructions
+                meta.log_messages = None; // Legacy bincode implementation does not support log_messages
+                meta.pre_token_balances = None; // Legacy bincode implementation does not support token balances
+                meta.post_token_balances = None; // Legacy bincode implementation does not support token balances
+                meta.rewards = None; // Legacy bincode implementation does not support rewards
+            }
+            assert_eq!(block, bincode_block.into());
+        } else {
+            panic!("deserialization should produce CellData::Bincode");
+        }
+
+        let result = deserialize_protobuf_or_bincode_cell_data::<
+            StoredConfirmedBlock,
+            generated::ConfirmedBlock,
+        >(&[("proto".to_string(), bincode_block)], "", "".to_string());
+        assert!(result.is_err());
+
+        let result = deserialize_protobuf_or_bincode_cell_data::<
+            StoredConfirmedBlock,
+            generated::ConfirmedBlock,
+        >(
+            &[("proto".to_string(), vec![1, 2, 3, 4])],
+            "",
+            "".to_string(),
+        );
+        assert!(result.is_err());
+
+        let result = deserialize_protobuf_or_bincode_cell_data::<
+            StoredConfirmedBlock,
+            generated::ConfirmedBlock,
+        >(&[("bin".to_string(), protobuf_block)], "", "".to_string());
+        assert!(result.is_err());
+
+        let result = deserialize_protobuf_or_bincode_cell_data::<
+            StoredConfirmedBlock,
+            generated::ConfirmedBlock,
+        >(&[("bin".to_string(), vec![1, 2, 3, 4])], "", "".to_string());
+        assert!(result.is_err());
+    }
 }

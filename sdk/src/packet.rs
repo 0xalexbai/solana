@@ -12,8 +12,7 @@ use std::{
 ///   8 bytes is the size of the fragment header
 pub const PACKET_DATA_SIZE: usize = 1280 - 40 - 8;
 
-#[frozen_abi(digest = "9AiPd36yycNg18hDuCBVGwpTfzjX1VV4QtUKUdqeyAKH")]
-#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize, AbiExample)]
+#[derive(Clone, Default, Debug, PartialEq)]
 #[repr(C)]
 pub struct Meta {
     pub size: usize,
@@ -25,6 +24,7 @@ pub struct Meta {
     pub v6: bool,
     pub seed: [u8; 32],
     pub slot: Slot,
+    pub is_tracer_tx: bool,
 }
 
 #[derive(Clone)]
@@ -39,12 +39,10 @@ impl Packet {
         Self { data, meta }
     }
 
-    pub fn from_data<T: Serialize>(dest: &SocketAddr, data: T) -> Self {
-        let mut me = Packet::default();
-        if let Err(e) = Self::populate_packet(&mut me, Some(dest), &data) {
-            logger::error!("Couldn't write to packet {:?}. Data skipped.", e);
-        }
-        me
+    pub fn from_data<T: Serialize>(dest: Option<&SocketAddr>, data: T) -> Result<Self> {
+        let mut packet = Packet::default();
+        Self::populate_packet(&mut packet, dest, &data)?;
+        Ok(packet)
     }
 
     pub fn populate_packet<T: Serialize>(
@@ -74,6 +72,7 @@ impl fmt::Debug for Packet {
     }
 }
 
+#[allow(clippy::uninit_assumed_init)]
 impl Default for Packet {
     fn default() -> Packet {
         Packet {
@@ -87,7 +86,7 @@ impl PartialEq for Packet {
     fn eq(&self, other: &Packet) -> bool {
         let self_data: &[u8] = self.data.as_ref();
         let other_data: &[u8] = other.data.as_ref();
-        self.meta == other.meta && self_data[..self.meta.size] == other_data[..other.meta.size]
+        self.meta == other.meta && self_data[..self.meta.size] == other_data[..self.meta.size]
     }
 }
 

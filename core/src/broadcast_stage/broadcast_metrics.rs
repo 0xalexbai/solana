@@ -13,28 +13,14 @@ pub(crate) struct BroadcastShredBatchInfo {
 }
 
 #[derive(Default, Clone)]
-pub(crate) struct ProcessShredsStats {
-    // Per-slot elapsed time
-    pub(crate) shredding_elapsed: u64,
-    pub(crate) receive_elapsed: u64,
-}
-impl ProcessShredsStats {
-    pub(crate) fn update(&mut self, new_stats: &ProcessShredsStats) {
-        self.shredding_elapsed += new_stats.shredding_elapsed;
-        self.receive_elapsed += new_stats.receive_elapsed;
-    }
-    pub(crate) fn reset(&mut self) {
-        *self = Self::default();
-    }
-}
-
-#[derive(Default, Clone)]
 pub struct TransmitShredsStats {
     pub transmit_elapsed: u64,
     pub send_mmsg_elapsed: u64,
     pub get_peers_elapsed: u64,
     pub shred_select: u64,
     pub num_shreds: usize,
+    pub total_packets: usize,
+    pub dropped_packets: usize,
 }
 
 impl BroadcastStats for TransmitShredsStats {
@@ -44,6 +30,8 @@ impl BroadcastStats for TransmitShredsStats {
         self.get_peers_elapsed += new_stats.get_peers_elapsed;
         self.num_shreds += new_stats.num_shreds;
         self.shred_select += new_stats.shred_select;
+        self.total_packets += new_stats.total_packets;
+        self.dropped_packets += new_stats.dropped_packets;
     }
     fn report_stats(&mut self, slot: Slot, slot_start: Instant) {
         datapoint_info!(
@@ -61,6 +49,8 @@ impl BroadcastStats for TransmitShredsStats {
             ("get_peers_elapsed", self.get_peers_elapsed as i64, i64),
             ("num_shreds", self.num_shreds as i64, i64),
             ("shred_select", self.shred_select as i64, i64),
+            ("total_packets", self.total_packets as i64, i64),
+            ("dropped_packets", self.dropped_packets as i64, i64),
         );
     }
 }
@@ -189,6 +179,8 @@ mod test {
                 send_mmsg_elapsed: 3,
                 shred_select: 4,
                 num_shreds: 5,
+                total_packets: 6,
+                dropped_packets: 7,
             },
             &Some(BroadcastShredBatchInfo {
                 slot: 0,
@@ -206,14 +198,18 @@ mod test {
         assert_eq!(slot_0_stats.broadcast_shred_stats.send_mmsg_elapsed, 3);
         assert_eq!(slot_0_stats.broadcast_shred_stats.shred_select, 4);
         assert_eq!(slot_0_stats.broadcast_shred_stats.num_shreds, 5);
+        assert_eq!(slot_0_stats.broadcast_shred_stats.total_packets, 6);
+        assert_eq!(slot_0_stats.broadcast_shred_stats.dropped_packets, 7);
 
         slot_broadcast_stats.update(
             &TransmitShredsStats {
-                transmit_elapsed: 7,
-                get_peers_elapsed: 8,
-                send_mmsg_elapsed: 9,
-                shred_select: 10,
-                num_shreds: 11,
+                transmit_elapsed: 11,
+                get_peers_elapsed: 12,
+                send_mmsg_elapsed: 13,
+                shred_select: 14,
+                num_shreds: 15,
+                total_packets: 16,
+                dropped_packets: 17,
             },
             &None,
         );
@@ -227,6 +223,8 @@ mod test {
         assert_eq!(slot_0_stats.broadcast_shred_stats.send_mmsg_elapsed, 3);
         assert_eq!(slot_0_stats.broadcast_shred_stats.shred_select, 4);
         assert_eq!(slot_0_stats.broadcast_shred_stats.num_shreds, 5);
+        assert_eq!(slot_0_stats.broadcast_shred_stats.total_packets, 6);
+        assert_eq!(slot_0_stats.broadcast_shred_stats.dropped_packets, 7);
 
         // If another batch is given, then total number of batches == num_expected_batches == 2,
         // so the batch should be purged from the HashMap
@@ -237,6 +235,8 @@ mod test {
                 send_mmsg_elapsed: 1,
                 shred_select: 1,
                 num_shreds: 1,
+                total_packets: 1,
+                dropped_packets: 1,
             },
             &Some(BroadcastShredBatchInfo {
                 slot: 0,
@@ -286,10 +286,9 @@ mod test {
             }
 
             assert!(slot_broadcast_stats.lock().unwrap().0.get(&slot).is_none());
-            let (returned_count, returned_slot, returned_instant) = receiver.recv().unwrap();
+            let (returned_count, returned_slot, _returned_instant) = receiver.recv().unwrap();
             assert_eq!(returned_count, num_threads);
             assert_eq!(returned_slot, slot);
-            assert_eq!(returned_instant, returned_instant);
         }
     }
 }

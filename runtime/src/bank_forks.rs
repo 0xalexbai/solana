@@ -1,63 +1,25 @@
 //! The `bank_forks` module implements BankForks a DAG of checkpointed Banks
 
-use crate::snapshot_package::{AccountsPackageSendError, AccountsPackageSender};
-use crate::snapshot_utils::{self, SnapshotError};
-use crate::{bank::Bank, status_cache::MAX_CACHE_ENTRIES};
+use crate::{
+    accounts_background_service::{AbsRequestSender, SnapshotRequest},
+    bank::Bank,
+    snapshot_config::SnapshotConfig,
+};
 use log::*;
-use solana_measure::measure::Measure;
 use solana_metrics::inc_new_counter_info;
-use solana_sdk::{clock::Slot, timing};
+use solana_sdk::{clock::Slot, hash::Hash, timing};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     ops::Index,
-    path::PathBuf,
     sync::Arc,
     time::Instant,
 };
-use thiserror::Error;
-
-pub use crate::snapshot_utils::SnapshotVersion;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CompressionType {
-    Bzip2,
-    Gzip,
-    Zstd,
-    NoCompression,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SnapshotConfig {
-    // Generate a new snapshot every this many slots
-    pub snapshot_interval_slots: u64,
-
-    // Where to store the latest packaged snapshot
-    pub snapshot_package_output_path: PathBuf,
-
-    // Where to place the snapshots for recent slots
-    pub snapshot_path: PathBuf,
-
-    pub compression: CompressionType,
-
-    // Snapshot version to generate
-    pub snapshot_version: SnapshotVersion,
-}
-
-#[derive(Error, Debug)]
-pub enum BankForksError {
-    #[error("snapshot error")]
-    SnapshotError(#[from] SnapshotError),
-
-    #[error("accounts package send error")]
-    AccountsPackageSendError(#[from] AccountsPackageSendError),
-}
-type Result<T> = std::result::Result<T, BankForksError>;
 
 pub struct BankForks {
-    pub banks: HashMap<Slot, Arc<Bank>>,
+    banks: HashMap<Slot, Arc<Bank>>,
+    descendants: HashMap<Slot, HashSet<Slot>>,
     root: Slot,
     pub snapshot_config: Option<SnapshotConfig>,
-    last_snapshot_slot: Slot,
 
     pub accounts_hash_interval_slots: Slot,
     last_accounts_hash_slot: Slot,
@@ -76,39 +38,25 @@ impl BankForks {
         Self::new_from_banks(&[Arc::new(bank)], root)
     }
 
+    pub fn banks(&self) -> &HashMap<Slot, Arc<Bank>> {
+        &self.banks
+    }
+
     /// Create a map of bank slot id to the set of ancestors for the bank slot.
     pub fn ancestors(&self) -> HashMap<Slot, HashSet<Slot>> {
-        let mut ancestors = HashMap::new();
         let root = self.root;
-        for bank in self.banks.values() {
-            let mut set: HashSet<Slot> = bank
-                .ancestors
-                .keys()
-                .filter(|k| **k >= root)
-                .cloned()
-                .collect();
-            set.remove(&bank.slot());
-            ancestors.insert(bank.slot(), set);
-        }
-        ancestors
+        self.banks
+            .iter()
+            .map(|(slot, bank)| {
+                let ancestors = bank.proper_ancestors().filter(|k| *k >= root);
+                (*slot, ancestors.collect())
+            })
+            .collect()
     }
 
     /// Create a map of bank slot id to the set of all of its descendants
-    #[allow(clippy::or_fun_call)]
-    pub fn descendants(&self) -> HashMap<Slot, HashSet<Slot>> {
-        let mut descendants = HashMap::new();
-        for bank in self.banks.values() {
-            let _ = descendants.entry(bank.slot()).or_insert(HashSet::new());
-            let mut set: HashSet<Slot> = bank.ancestors.keys().cloned().collect();
-            set.remove(&bank.slot());
-            for parent in set {
-                descendants
-                    .entry(parent)
-                    .or_insert(HashSet::new())
-                    .insert(bank.slot());
-            }
-        }
-        descendants
+    pub fn descendants(&self) -> &HashMap<Slot, HashSet<Slot>> {
+        &self.descendants
     }
 
     pub fn frozen_banks(&self) -> HashMap<Slot, Arc<Bank>> {
@@ -131,8 +79,23 @@ impl BankForks {
         self.banks.get(&bank_slot)
     }
 
-    pub fn root_bank(&self) -> &Arc<Bank> {
-        &self[self.root()]
+    pub fn get_with_checked_hash(
+        &self,
+        (bank_slot, expected_hash): (Slot, Hash),
+    ) -> Option<&Arc<Bank>> {
+        let maybe_bank = self.banks.get(&bank_slot);
+        if let Some(bank) = maybe_bank {
+            assert_eq!(bank.hash(), expected_hash);
+        }
+        maybe_bank
+    }
+
+    pub fn bank_hash(&self, slot: Slot) -> Option<Hash> {
+        self.get(slot).map(|bank| bank.hash())
+    }
+
+    pub fn root_bank(&self) -> Arc<Bank> {
+        self[self.root()].clone()
     }
 
     pub fn new_from_banks(initial_forks: &[Arc<Bank>], root: Slot) -> Self {
@@ -150,12 +113,18 @@ impl BankForks {
                 banks.insert(parent.slot(), parent.clone());
             }
         }
-
+        let mut descendants = HashMap::<_, HashSet<_>>::new();
+        for (slot, bank) in &banks {
+            descendants.entry(*slot).or_default();
+            for parent in bank.proper_ancestors() {
+                descendants.entry(parent).or_default().insert(*slot);
+            }
+        }
         Self {
             root,
             banks,
+            descendants,
             snapshot_config: None,
-            last_snapshot_slot: root,
             accounts_hash_interval_slots: std::u64::MAX,
             last_accounts_hash_slot: root,
         }
@@ -165,11 +134,34 @@ impl BankForks {
         let bank = Arc::new(bank);
         let prev = self.banks.insert(bank.slot(), bank.clone());
         assert!(prev.is_none());
+        let slot = bank.slot();
+        self.descendants.entry(slot).or_default();
+        for parent in bank.proper_ancestors() {
+            self.descendants.entry(parent).or_default().insert(slot);
+        }
         bank
     }
 
     pub fn remove(&mut self, slot: Slot) -> Option<Arc<Bank>> {
-        self.banks.remove(&slot)
+        let bank = self.banks.remove(&slot)?;
+        for parent in bank.proper_ancestors() {
+            let mut entry = match self.descendants.entry(parent) {
+                Entry::Vacant(_) => panic!("this should not happen!"),
+                Entry::Occupied(entry) => entry,
+            };
+            entry.get_mut().remove(&slot);
+            if entry.get().is_empty() && !self.banks.contains_key(&parent) {
+                entry.remove_entry();
+            }
+        }
+        let entry = match self.descendants.entry(slot) {
+            Entry::Vacant(_) => panic!("this should not happen!"),
+            Entry::Occupied(entry) => entry,
+        };
+        if entry.get().is_empty() {
+            entry.remove_entry();
+        }
+        Some(bank)
     }
 
     pub fn highest_slot(&self) -> Slot {
@@ -183,7 +175,7 @@ impl BankForks {
     pub fn set_root(
         &mut self,
         root: Slot,
-        accounts_package_sender: &Option<AccountsPackageSender>,
+        accounts_background_request_sender: &AbsRequestSender,
         highest_confirmed_root: Option<Slot>,
     ) {
         let old_epoch = self.root_bank().epoch();
@@ -229,29 +221,25 @@ impl BankForks {
                 bank.squash();
                 is_root_bank_squashed = bank_slot == root;
 
-                bank.update_accounts_hash();
-
-                if self.snapshot_config.is_some() && accounts_package_sender.is_some() {
-                    // Generate an accounts package
-                    let mut snapshot_time = Measure::start("total-snapshot-ms");
-                    let r = self.generate_accounts_package(
-                        bank_slot,
-                        &bank.src.roots(),
-                        accounts_package_sender.as_ref().unwrap(),
-                    );
-                    if r.is_err() {
+                if self.snapshot_config.is_some()
+                    && accounts_background_request_sender.is_snapshot_creation_enabled()
+                {
+                    let snapshot_root_bank = self.root_bank();
+                    let root_slot = snapshot_root_bank.slot();
+                    if let Err(e) =
+                        accounts_background_request_sender.send_snapshot_request(SnapshotRequest {
+                            snapshot_root_bank,
+                            // Save off the status cache because these may get pruned
+                            // if another `set_root()` is called before the snapshots package
+                            // can be generated
+                            status_cache_slot_deltas: bank.src.slot_deltas(&bank.src.roots()),
+                        })
+                    {
                         warn!(
-                            "Error generating snapshot for bank: {}, err: {:?}",
-                            bank_slot, r
+                            "Error sending snapshot request for bank: {}, err: {:?}",
+                            root_slot, e
                         );
-                    } else {
-                        self.last_snapshot_slot = bank_slot;
                     }
-
-                    // Cleanup outdated snapshots
-                    self.purge_old_snapshots();
-                    snapshot_time.stop();
-                    inc_new_counter_info!("total-snapshot-ms", snapshot_time.as_ms() as usize);
                 }
                 break;
             }
@@ -260,8 +248,7 @@ impl BankForks {
             root_bank.squash();
         }
         let new_tx_count = root_bank.transaction_count();
-
-        self.prune_non_root(root, highest_confirmed_root);
+        self.prune_non_rooted(root, highest_confirmed_root);
 
         inc_new_counter_info!(
             "bank-forks_set_root_ms",
@@ -277,76 +264,74 @@ impl BankForks {
         self.root
     }
 
-    pub fn purge_old_snapshots(&self) {
-        // Remove outdated snapshots
-        let config = self.snapshot_config.as_ref().unwrap();
-        let slot_snapshot_paths = snapshot_utils::get_snapshot_paths(&config.snapshot_path);
-        let num_to_remove = slot_snapshot_paths.len().saturating_sub(MAX_CACHE_ENTRIES);
-        for slot_files in &slot_snapshot_paths[..num_to_remove] {
-            let r = snapshot_utils::remove_snapshot(slot_files.slot, &config.snapshot_path);
-            if r.is_err() {
-                warn!("Couldn't remove snapshot at: {:?}", config.snapshot_path);
-            }
+    /// After setting a new root, prune the banks that are no longer on rooted paths
+    ///
+    /// Given the following banks and slots...
+    ///
+    /// ```text
+    /// slot 6                   * (G)
+    ///                         /
+    /// slot 5        (F)  *   /
+    ///                    |  /
+    /// slot 4    (E) *    | /
+    ///               |    |/
+    /// slot 3        |    * (D) <-- root, from set_root()
+    ///               |    |
+    /// slot 2    (C) *    |
+    ///                \   |
+    /// slot 1          \  * (B)
+    ///                  \ |
+    /// slot 0             * (A)  <-- highest confirmed root [1]
+    /// ```
+    ///
+    /// ...where (D) is set as root, clean up (C) and (E), since they are not rooted.
+    ///
+    /// (A) is kept because it is greater-than-or-equal-to the highest confirmed root, and (D) is
+    ///     one of its descendants
+    /// (B) is kept for the same reason as (A)
+    /// (C) is pruned since it is a lower slot than (D), but (D) is _not_ one of its descendants
+    /// (D) is kept since it is the root
+    /// (E) is pruned since it is not a descendant of (D)
+    /// (F) is kept since it is a descendant of (D)
+    /// (G) is kept for the same reason as (F)
+    ///
+    /// and in table form...
+    ///
+    /// ```text
+    ///       |          |  is root a  | is a descendant ||
+    ///  slot | is root? | descendant? |    of root?     || keep?
+    /// ------+----------+-------------+-----------------++-------
+    ///   (A) |     N    |      Y      |        N        ||   Y
+    ///   (B) |     N    |      Y      |        N        ||   Y
+    ///   (C) |     N    |      N      |        N        ||   N
+    ///   (D) |     Y    |      N      |        N        ||   Y
+    ///   (E) |     N    |      N      |        N        ||   N
+    ///   (F) |     N    |      N      |        Y        ||   Y
+    ///   (G) |     N    |      N      |        Y        ||   Y
+    /// ```
+    ///
+    /// [1] RPC has the concept of commitment level, which is based on the highest confirmed root,
+    /// i.e. the cluster-confirmed root.  This commitment is stronger than the local node's root.
+    /// So (A) and (B) are kept to facilitate RPC at different commitment levels.  Everything below
+    /// the highest confirmed root can be pruned.
+    fn prune_non_rooted(&mut self, root: Slot, highest_confirmed_root: Option<Slot>) {
+        let highest_confirmed_root = highest_confirmed_root.unwrap_or(root);
+        let prune_slots: Vec<_> = self
+            .banks
+            .keys()
+            .copied()
+            .filter(|slot| {
+                let keep = *slot == root
+                    || self.descendants[&root].contains(slot)
+                    || (*slot < root
+                        && *slot >= highest_confirmed_root
+                        && self.descendants[slot].contains(&root));
+                !keep
+            })
+            .collect();
+        for slot in prune_slots {
+            self.remove(slot);
         }
-    }
-
-    pub fn generate_accounts_package(
-        &self,
-        root: Slot,
-        slots_to_snapshot: &[Slot],
-        accounts_package_sender: &AccountsPackageSender,
-    ) -> Result<()> {
-        let config = self.snapshot_config.as_ref().unwrap();
-
-        // Add a snapshot for the new root
-        let bank = self
-            .get(root)
-            .cloned()
-            .expect("root must exist in BankForks");
-
-        let storages: Vec<_> = bank.get_snapshot_storages();
-        let mut add_snapshot_time = Measure::start("add-snapshot-ms");
-        snapshot_utils::add_snapshot(
-            &config.snapshot_path,
-            &bank,
-            &storages,
-            config.snapshot_version,
-        )?;
-        add_snapshot_time.stop();
-        inc_new_counter_info!("add-snapshot-ms", add_snapshot_time.as_ms() as usize);
-
-        // Package the relevant snapshots
-        let slot_snapshot_paths = snapshot_utils::get_snapshot_paths(&config.snapshot_path);
-        let latest_slot_snapshot_paths = slot_snapshot_paths
-            .last()
-            .expect("no snapshots found in config snapshot_path");
-        // We only care about the last bank's snapshot.
-        // We'll ask the bank for MAX_CACHE_ENTRIES (on the rooted path) worth of statuses
-        let package = snapshot_utils::package_snapshot(
-            &bank,
-            latest_slot_snapshot_paths,
-            &config.snapshot_path,
-            slots_to_snapshot,
-            &config.snapshot_package_output_path,
-            storages,
-            config.compression.clone(),
-            config.snapshot_version,
-        )?;
-
-        accounts_package_sender.send(package)?;
-
-        Ok(())
-    }
-
-    fn prune_non_root(&mut self, root: Slot, highest_confirmed_root: Option<Slot>) {
-        let descendants = self.descendants();
-        self.banks.retain(|slot, _| {
-            *slot == root
-                || descendants[&root].contains(slot)
-                || (*slot < root
-                    && *slot >= highest_confirmed_root.unwrap_or(root)
-                    && descendants[slot].contains(&root))
-        });
         datapoint_debug!(
             "bank_forks_purge_non_root",
             ("num_banks_retained", self.banks.len(), i64),
@@ -369,9 +354,20 @@ impl BankForks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genesis_utils::{create_genesis_config, GenesisConfigInfo};
+    use crate::{
+        bank::tests::update_vote_account_timestamp,
+        genesis_utils::{
+            create_genesis_config, create_genesis_config_with_leader, GenesisConfigInfo,
+        },
+    };
     use solana_sdk::hash::Hash;
-    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::{
+        clock::UnixTimestamp,
+        pubkey::Pubkey,
+        signature::{Keypair, Signer},
+        sysvar::epoch_schedule::EpochSchedule,
+    };
+    use solana_vote_program::vote_state::BlockTimestamp;
 
     #[test]
     fn test_bank_forks_new() {
@@ -454,5 +450,199 @@ mod tests {
         let child_bank = Bank::new_from_parent(&bank_forks[0u64], &Pubkey::default(), 1);
         bank_forks.insert(child_bank);
         assert_eq!(bank_forks.active_banks(), vec![1]);
+    }
+
+    #[test]
+    fn test_bank_forks_different_set_root() {
+        solana_logger::setup();
+        let leader_keypair = Keypair::new();
+        let GenesisConfigInfo {
+            mut genesis_config,
+            mint_keypair: _,
+            voting_keypair,
+        } = create_genesis_config_with_leader(10_000, &leader_keypair.pubkey(), 1_000);
+        let slots_in_epoch = 32;
+        genesis_config.epoch_schedule = EpochSchedule::new(slots_in_epoch);
+
+        let bank0 = Bank::new(&genesis_config);
+        let mut bank_forks0 = BankForks::new(bank0);
+        bank_forks0.set_root(0, &AbsRequestSender::default(), None);
+
+        let bank1 = Bank::new(&genesis_config);
+        let mut bank_forks1 = BankForks::new(bank1);
+
+        let additional_timestamp_secs = 2;
+
+        let num_slots = slots_in_epoch + 1; // Advance past first epoch boundary
+        for slot in 1..num_slots {
+            // Just after the epoch boundary, timestamp a vote that will shift
+            // Clock::unix_timestamp from Bank::unix_timestamp_from_genesis()
+            let update_timestamp_case = slot == slots_in_epoch;
+
+            let child1 = Bank::new_from_parent(&bank_forks0[slot - 1], &Pubkey::default(), slot);
+            let child2 = Bank::new_from_parent(&bank_forks1[slot - 1], &Pubkey::default(), slot);
+
+            if update_timestamp_case {
+                for child in &[&child1, &child2] {
+                    let recent_timestamp: UnixTimestamp = child.unix_timestamp_from_genesis();
+                    update_vote_account_timestamp(
+                        BlockTimestamp {
+                            slot: child.slot(),
+                            timestamp: recent_timestamp + additional_timestamp_secs,
+                        },
+                        child,
+                        &voting_keypair.pubkey(),
+                    );
+                }
+            }
+
+            // Set root in bank_forks0 to truncate the ancestor history
+            bank_forks0.insert(child1);
+            bank_forks0.set_root(slot, &AbsRequestSender::default(), None);
+
+            // Don't set root in bank_forks1 to keep the ancestor history
+            bank_forks1.insert(child2);
+        }
+        let child1 = &bank_forks0.working_bank();
+        let child2 = &bank_forks1.working_bank();
+
+        child1.freeze();
+        child2.freeze();
+
+        info!("child0.ancestors: {:?}", child1.ancestors);
+        info!("child1.ancestors: {:?}", child2.ancestors);
+        assert_eq!(child1.hash(), child2.hash());
+    }
+
+    fn make_hash_map(data: Vec<(Slot, Vec<Slot>)>) -> HashMap<Slot, HashSet<Slot>> {
+        data.into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect()
+    }
+
+    #[test]
+    fn test_bank_forks_with_set_root() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let mut banks = vec![Arc::new(Bank::new(&genesis_config))];
+        assert_eq!(banks[0].slot(), 0);
+        let mut bank_forks = BankForks::new_from_banks(&banks, 0);
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[0], &Pubkey::default(), 1)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[1], &Pubkey::default(), 2)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[0], &Pubkey::default(), 3)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[3], &Pubkey::default(), 4)));
+        assert_eq!(
+            bank_forks.ancestors(),
+            make_hash_map(vec![
+                (0, vec![]),
+                (1, vec![0]),
+                (2, vec![0, 1]),
+                (3, vec![0]),
+                (4, vec![0, 3]),
+            ])
+        );
+        assert_eq!(
+            *bank_forks.descendants(),
+            make_hash_map(vec![
+                (0, vec![1, 2, 3, 4]),
+                (1, vec![2]),
+                (2, vec![]),
+                (3, vec![4]),
+                (4, vec![]),
+            ])
+        );
+        bank_forks.set_root(
+            2,
+            &AbsRequestSender::default(),
+            None, // highest confirmed root
+        );
+        banks[2].squash();
+        assert_eq!(bank_forks.ancestors(), make_hash_map(vec![(2, vec![]),]));
+        assert_eq!(
+            *bank_forks.descendants(),
+            make_hash_map(vec![(0, vec![2]), (1, vec![2]), (2, vec![]),])
+        );
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[2], &Pubkey::default(), 5)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[5], &Pubkey::default(), 6)));
+        assert_eq!(
+            bank_forks.ancestors(),
+            make_hash_map(vec![(2, vec![]), (5, vec![2]), (6, vec![2, 5])])
+        );
+        assert_eq!(
+            *bank_forks.descendants(),
+            make_hash_map(vec![
+                (0, vec![2]),
+                (1, vec![2]),
+                (2, vec![5, 6]),
+                (5, vec![6]),
+                (6, vec![])
+            ])
+        );
+    }
+
+    #[test]
+    fn test_bank_forks_with_highest_confirmed_root() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let mut banks = vec![Arc::new(Bank::new(&genesis_config))];
+        assert_eq!(banks[0].slot(), 0);
+        let mut bank_forks = BankForks::new_from_banks(&banks, 0);
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[0], &Pubkey::default(), 1)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[1], &Pubkey::default(), 2)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[0], &Pubkey::default(), 3)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[3], &Pubkey::default(), 4)));
+        assert_eq!(
+            bank_forks.ancestors(),
+            make_hash_map(vec![
+                (0, vec![]),
+                (1, vec![0]),
+                (2, vec![0, 1]),
+                (3, vec![0]),
+                (4, vec![0, 3]),
+            ])
+        );
+        assert_eq!(
+            *bank_forks.descendants(),
+            make_hash_map(vec![
+                (0, vec![1, 2, 3, 4]),
+                (1, vec![2]),
+                (2, vec![]),
+                (3, vec![4]),
+                (4, vec![]),
+            ])
+        );
+        bank_forks.set_root(
+            2,
+            &AbsRequestSender::default(),
+            Some(1), // highest confirmed root
+        );
+        banks[2].squash();
+        assert_eq!(
+            bank_forks.ancestors(),
+            make_hash_map(vec![(1, vec![]), (2, vec![]),])
+        );
+        assert_eq!(
+            *bank_forks.descendants(),
+            make_hash_map(vec![(0, vec![1, 2]), (1, vec![2]), (2, vec![]),])
+        );
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[2], &Pubkey::default(), 5)));
+        banks.push(bank_forks.insert(Bank::new_from_parent(&banks[5], &Pubkey::default(), 6)));
+        assert_eq!(
+            bank_forks.ancestors(),
+            make_hash_map(vec![
+                (1, vec![]),
+                (2, vec![]),
+                (5, vec![2]),
+                (6, vec![2, 5])
+            ])
+        );
+        assert_eq!(
+            *bank_forks.descendants(),
+            make_hash_map(vec![
+                (0, vec![1, 2]),
+                (1, vec![2]),
+                (2, vec![5, 6]),
+                (5, vec![6]),
+                (6, vec![])
+            ])
+        );
     }
 }

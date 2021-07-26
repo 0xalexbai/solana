@@ -113,11 +113,14 @@ impl SyncClient for BankClient {
     }
 
     fn get_account_data(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>> {
-        Ok(self.bank.get_account(pubkey).map(|account| account.data))
+        Ok(self
+            .bank
+            .get_account(pubkey)
+            .map(|account| Account::from(account).data))
     }
 
     fn get_account(&self, pubkey: &Pubkey) -> Result<Option<Account>> {
-        Ok(self.bank.get_account(pubkey))
+        Ok(self.bank.get_account(pubkey).map(Account::from))
     }
 
     fn get_account_with_commitment(
@@ -125,7 +128,7 @@ impl SyncClient for BankClient {
         pubkey: &Pubkey,
         _commitment_config: CommitmentConfig,
     ) -> Result<Option<Account>> {
-        Ok(self.bank.get_account(pubkey))
+        Ok(self.bank.get_account(pubkey).map(Account::from))
     }
 
     fn get_balance(&self, pubkey: &Pubkey) -> Result<u64> {
@@ -138,6 +141,10 @@ impl SyncClient for BankClient {
         _commitment_config: CommitmentConfig,
     ) -> Result<u64> {
         Ok(self.bank.get_balance(pubkey))
+    }
+
+    fn get_minimum_balance_for_rent_exemption(&self, data_len: usize) -> Result<u64> {
+        Ok(self.bank.get_minimum_balance_for_rent_exemption(data_len))
     }
 
     fn get_recent_blockhash(&self) -> Result<(Hash, FeeCalculator)> {
@@ -273,7 +280,7 @@ impl BankClient {
             while let Ok(tx) = transaction_receiver.try_recv() {
                 transactions.push(tx);
             }
-            let _ = bank.process_transactions(&transactions);
+            let _ = bank.try_process_transactions(transactions.iter());
         }
     }
 
@@ -313,7 +320,7 @@ mod tests {
         let bank_client = BankClient::new(bank);
 
         // Create 2-2 Multisig Transfer instruction.
-        let bob_pubkey = Pubkey::new_rand();
+        let bob_pubkey = solana_sdk::pubkey::new_rand();
         let mut transfer_instruction = system_instruction::transfer(&john_pubkey, &bob_pubkey, 42);
         transfer_instruction
             .accounts

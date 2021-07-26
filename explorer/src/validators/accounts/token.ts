@@ -1,6 +1,7 @@
+/* eslint-disable @typescript-eslint/no-redeclare */
+
 import {
-  object,
-  StructType,
+  Infer,
   number,
   optional,
   enums,
@@ -8,46 +9,55 @@ import {
   boolean,
   string,
   array,
-  pick,
+  type,
   nullable,
 } from "superstruct";
-import { Pubkey } from "validators/pubkey";
+import { PublicKeyFromString } from "validators/pubkey";
 
-export type TokenAccountType = StructType<typeof TokenAccountType>;
+export type TokenAccountType = Infer<typeof TokenAccountType>;
 export const TokenAccountType = enums(["mint", "account", "multisig"]);
 
-export type TokenAccountInfo = StructType<typeof TokenAccountInfo>;
-export const TokenAccountInfo = pick({
-  isInitialized: boolean(),
-  isNative: boolean(),
-  mint: Pubkey,
-  owner: Pubkey,
-  tokenAmount: pick({
-    decimals: number(),
-    uiAmount: number(),
-    amount: string(),
-  }),
-  delegate: nullable(optional(Pubkey)),
-  delegatedAmount: optional(number()),
+export type TokenAccountState = Infer<typeof AccountState>;
+const AccountState = enums(["initialized", "uninitialized", "frozen"]);
+
+const TokenAmount = type({
+  decimals: number(),
+  uiAmountString: string(),
+  amount: string(),
 });
 
-export type MintAccountInfo = StructType<typeof MintAccountInfo>;
-export const MintAccountInfo = object({
+export type TokenAccountInfo = Infer<typeof TokenAccountInfo>;
+export const TokenAccountInfo = type({
+  mint: PublicKeyFromString,
+  owner: PublicKeyFromString,
+  tokenAmount: TokenAmount,
+  delegate: optional(PublicKeyFromString),
+  state: AccountState,
+  isNative: boolean(),
+  rentExemptReserve: optional(TokenAmount),
+  delegatedAmount: optional(TokenAmount),
+  closeAuthority: optional(PublicKeyFromString),
+});
+
+export type MintAccountInfo = Infer<typeof MintAccountInfo>;
+export const MintAccountInfo = type({
+  mintAuthority: nullable(PublicKeyFromString),
+  supply: string(),
   decimals: number(),
   isInitialized: boolean(),
-  owner: nullable(optional(Pubkey)),
+  freezeAuthority: nullable(PublicKeyFromString),
 });
 
-export type MultisigAccountInfo = StructType<typeof MultisigAccountInfo>;
-export const MultisigAccountInfo = object({
+export type MultisigAccountInfo = Infer<typeof MultisigAccountInfo>;
+export const MultisigAccountInfo = type({
   numRequiredSigners: number(),
   numValidSigners: number(),
   isInitialized: boolean(),
-  signers: array(Pubkey),
+  signers: array(PublicKeyFromString),
 });
 
-export type TokenAccount = StructType<typeof TokenAccount>;
-export const TokenAccount = object({
+export type TokenAccount = Infer<typeof TokenAccount>;
+export const TokenAccount = type({
   type: TokenAccountType,
   info: any(),
 });

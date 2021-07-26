@@ -1,15 +1,11 @@
+#![allow(clippy::integer_arithmetic)]
 use clap::{crate_description, crate_name, value_t, App, Arg};
 use crossbeam_channel::unbounded;
 use log::*;
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
-use solana_core::{
-    banking_stage::{create_test_recorder, BankingStage},
-    cluster_info::ClusterInfo,
-    cluster_info::Node,
-    poh_recorder::PohRecorder,
-    poh_recorder::WorkingBankEntry,
-};
+use solana_core::{banking_stage::BankingStage, cost_model::CostModel, cost_tracker::CostTracker};
+use solana_gossip::{cluster_info::ClusterInfo, cluster_info::Node};
 use solana_ledger::{
     blockstore::Blockstore,
     genesis_utils::{create_genesis_config, GenesisConfigInfo},
@@ -17,18 +13,21 @@ use solana_ledger::{
 };
 use solana_measure::measure::Measure;
 use solana_perf::packet::to_packets_chunked;
-use solana_runtime::{bank::Bank, bank_forks::BankForks};
+use solana_poh::poh_recorder::{create_test_recorder, PohRecorder, WorkingBankEntry};
+use solana_runtime::{
+    accounts_background_service::AbsRequestSender, bank::Bank, bank_forks::BankForks,
+};
 use solana_sdk::{
     hash::Hash,
-    pubkey::Pubkey,
     signature::Keypair,
     signature::Signature,
     system_transaction,
     timing::{duration_as_us, timestamp},
     transaction::Transaction,
 };
+use solana_streamer::socket::SocketAddrSpace;
 use std::{
-    sync::{atomic::Ordering, mpsc::Receiver, Arc, Mutex},
+    sync::{atomic::Ordering, mpsc::Receiver, Arc, Mutex, RwLock},
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -69,18 +68,18 @@ fn make_accounts_txs(
     hash: Hash,
     same_payer: bool,
 ) -> Vec<Transaction> {
-    let to_pubkey = Pubkey::new_rand();
+    let to_pubkey = solana_sdk::pubkey::new_rand();
     let payer_key = Keypair::new();
     let dummy = system_transaction::transfer(&payer_key, &to_pubkey, 1, hash);
     (0..total_num_transactions)
         .into_par_iter()
         .map(|_| {
             let mut new = dummy.clone();
-            let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
+            let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
             if !same_payer {
-                new.message.account_keys[0] = Pubkey::new_rand();
+                new.message.account_keys[0] = solana_sdk::pubkey::new_rand();
             }
-            new.message.account_keys[1] = Pubkey::new_rand();
+            new.message.account_keys[1] = solana_sdk::pubkey::new_rand();
             new.signatures = vec![Signature::new(&sig[0..64])];
             new
         })
@@ -187,7 +186,7 @@ fn main() {
             genesis_config.hash(),
         );
         // Ignore any pesky duplicate signature errors in the case we are using single-payer
-        let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
+        let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
         fund.signatures = vec![Signature::new(&sig[0..64])];
         let x = bank.process_transaction(&fund);
         x.unwrap();
@@ -197,12 +196,13 @@ fn main() {
     if !skip_sanity {
         //sanity check, make sure all the transactions can execute sequentially
         transactions.iter().for_each(|tx| {
-            let res = bank.process_transaction(&tx);
+            let res = bank.process_transaction(tx);
             assert!(res.is_ok(), "sanity test transactions error: {:?}", res);
         });
         bank.clear_signatures();
         //sanity check, make sure all the transactions can execute in parallel
-        let res = bank.process_transactions(&transactions);
+
+        let res = bank.process_transactions(transactions.iter());
         for r in res {
             assert!(r.is_ok(), "sanity parallel execution error: {:?}", r);
         }
@@ -217,7 +217,11 @@ fn main() {
         );
         let (exit, poh_recorder, poh_service, signal_receiver) =
             create_test_recorder(&bank, &blockstore, None);
-        let cluster_info = ClusterInfo::new_with_invalid_keypair(Node::new_localhost().info);
+        let cluster_info = ClusterInfo::new(
+            Node::new_localhost().info,
+            Arc::new(Keypair::new()),
+            SocketAddrSpace::Unspecified,
+        );
         let cluster_info = Arc::new(cluster_info);
         let banking_stage = BankingStage::new(
             &cluster_info,
@@ -226,6 +230,9 @@ fn main() {
             vote_receiver,
             None,
             replay_vote_sender,
+            Arc::new(RwLock::new(CostTracker::new(Arc::new(RwLock::new(
+                CostModel::default(),
+            ))))),
         );
         poh_recorder.lock().unwrap().set_bank(&bank);
 
@@ -241,7 +248,7 @@ fn main() {
         let base_tx_count = bank.transaction_count();
         let mut txs_processed = 0;
         let mut root = 1;
-        let collector = Pubkey::new_rand();
+        let collector = solana_sdk::pubkey::new_rand();
         let config = Config {
             packets_per_batch: packets_per_chunk,
             chunk_len,
@@ -324,7 +331,7 @@ fn main() {
                 poh_recorder.lock().unwrap().set_bank(&bank);
                 assert!(poh_recorder.lock().unwrap().bank().is_some());
                 if bank.slot() > 32 {
-                    bank_forks.set_root(root, &None, None);
+                    bank_forks.set_root(root, &AbsRequestSender::default(), None);
                     root += 1;
                 }
                 debug!(
@@ -353,7 +360,7 @@ fn main() {
             if bank.slot() > 0 && bank.slot() % 16 == 0 {
                 for tx in transactions.iter_mut() {
                     tx.message.recent_blockhash = bank.last_blockhash();
-                    let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen()).collect();
+                    let sig: Vec<u8> = (0..64).map(|_| thread_rng().gen::<u8>()).collect();
                     tx.signatures[0] = Signature::new(&sig[0..64]);
                 }
                 verified = to_packets_chunked(&transactions.clone(), packets_per_chunk);

@@ -1,39 +1,44 @@
 //! A stage to broadcast data from a leader node to validators
+#![allow(clippy::rc_buffer)]
 use self::{
-    broadcast_fake_shreds_run::BroadcastFakeShredsRun, broadcast_metrics::*,
+    broadcast_duplicates_run::{BroadcastDuplicatesConfig, BroadcastDuplicatesRun},
+    broadcast_fake_shreds_run::BroadcastFakeShredsRun,
+    broadcast_metrics::*,
     fail_entry_verification_broadcast_run::FailEntryVerificationBroadcastRun,
     standard_broadcast_run::StandardBroadcastRun,
 };
-use crate::contact_info::ContactInfo;
-use crate::crds_gossip_pull::CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS;
-use crate::weighted_shuffle::weighted_best;
 use crate::{
-    cluster_info::{ClusterInfo, ClusterInfoError},
-    poh_recorder::WorkingBankEntry,
+    cluster_nodes::ClusterNodes,
     result::{Error, Result},
 };
 use crossbeam_channel::{
     Receiver as CrossbeamReceiver, RecvTimeoutError as CrossbeamRecvTimeoutError,
     Sender as CrossbeamSender,
 };
-use solana_ledger::{blockstore::Blockstore, shred::Shred, staking_utils};
+use solana_gossip::cluster_info::{ClusterInfo, ClusterInfoError};
+use solana_ledger::{blockstore::Blockstore, shred::Shred};
 use solana_measure::measure::Measure;
 use solana_metrics::{inc_new_counter_error, inc_new_counter_info};
-use solana_runtime::bank::Bank;
+use solana_poh::poh_recorder::WorkingBankEntry;
+use solana_runtime::{bank::Bank, bank_forks::BankForks};
 use solana_sdk::timing::timestamp;
-use solana_sdk::{clock::Slot, pubkey::Pubkey};
-use solana_streamer::sendmmsg::send_mmsg;
+use solana_sdk::{clock::Slot, pubkey::Pubkey, signature::Keypair};
+use solana_streamer::{
+    sendmmsg::{batch_send, SendPktsError},
+    socket::SocketAddrSpace,
+};
 use std::sync::atomic::AtomicU64;
 use std::{
     collections::HashMap,
     net::UdpSocket,
     sync::atomic::{AtomicBool, Ordering},
     sync::mpsc::{channel, Receiver, RecvError, RecvTimeoutError, Sender},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     thread::{self, Builder, JoinHandle},
     time::{Duration, Instant},
 };
 
+pub mod broadcast_duplicates_run;
 mod broadcast_fake_shreds_run;
 pub mod broadcast_metrics;
 pub(crate) mod broadcast_utils;
@@ -56,9 +61,11 @@ pub enum BroadcastStageType {
     Standard,
     FailEntryVerification,
     BroadcastFakeShreds,
+    BroadcastDuplicates(BroadcastDuplicatesConfig),
 }
 
 impl BroadcastStageType {
+    #[allow(clippy::too_many_arguments)]
     pub fn new_broadcast_stage(
         &self,
         sock: Vec<UdpSocket>,
@@ -67,9 +74,9 @@ impl BroadcastStageType {
         retransmit_slots_receiver: RetransmitSlotsReceiver,
         exit_sender: &Arc<AtomicBool>,
         blockstore: &Arc<Blockstore>,
+        bank_forks: &Arc<RwLock<BankForks>>,
         shred_version: u16,
     ) -> BroadcastStage {
-        let keypair = cluster_info.keypair.clone();
         match self {
             BroadcastStageType::Standard => BroadcastStage::new(
                 sock,
@@ -78,7 +85,8 @@ impl BroadcastStageType {
                 retransmit_slots_receiver,
                 exit_sender,
                 blockstore,
-                StandardBroadcastRun::new(keypair, shred_version),
+                bank_forks,
+                StandardBroadcastRun::new(shred_version),
             ),
 
             BroadcastStageType::FailEntryVerification => BroadcastStage::new(
@@ -88,7 +96,8 @@ impl BroadcastStageType {
                 retransmit_slots_receiver,
                 exit_sender,
                 blockstore,
-                FailEntryVerificationBroadcastRun::new(keypair, shred_version),
+                bank_forks,
+                FailEntryVerificationBroadcastRun::new(shred_version),
             ),
 
             BroadcastStageType::BroadcastFakeShreds => BroadcastStage::new(
@@ -98,7 +107,19 @@ impl BroadcastStageType {
                 retransmit_slots_receiver,
                 exit_sender,
                 blockstore,
-                BroadcastFakeShredsRun::new(keypair, 0, shred_version),
+                bank_forks,
+                BroadcastFakeShredsRun::new(0, shred_version),
+            ),
+
+            BroadcastStageType::BroadcastDuplicates(config) => BroadcastStage::new(
+                sock,
+                cluster_info,
+                receiver,
+                retransmit_slots_receiver,
+                exit_sender,
+                blockstore,
+                bank_forks,
+                BroadcastDuplicatesRun::new(shred_version, config.clone()),
             ),
         }
     }
@@ -108,6 +129,7 @@ pub type TransmitShreds = (Option<Arc<HashMap<Pubkey, u64>>>, Arc<Vec<Shred>>);
 trait BroadcastRun {
     fn run(
         &mut self,
+        keypair: &Keypair,
         blockstore: &Arc<Blockstore>,
         receiver: &Receiver<WorkingBankEntry>,
         socket_sender: &Sender<(TransmitShreds, Option<BroadcastShredBatchInfo>)>,
@@ -118,6 +140,7 @@ trait BroadcastRun {
         receiver: &Arc<Mutex<TransmitReceiver>>,
         cluster_info: &ClusterInfo,
         sock: &UdpSocket,
+        bank_forks: &Arc<RwLock<BankForks>>,
     ) -> Result<()>;
     fn record(
         &mut self,
@@ -151,6 +174,7 @@ pub struct BroadcastStage {
 impl BroadcastStage {
     #[allow(clippy::too_many_arguments)]
     fn run(
+        cluster_info: Arc<ClusterInfo>,
         blockstore: &Arc<Blockstore>,
         receiver: &Receiver<WorkingBankEntry>,
         socket_sender: &Sender<(TransmitShreds, Option<BroadcastShredBatchInfo>)>,
@@ -158,8 +182,13 @@ impl BroadcastStage {
         mut broadcast_stage_run: impl BroadcastRun,
     ) -> BroadcastStageReturnType {
         loop {
-            let res =
-                broadcast_stage_run.run(blockstore, receiver, socket_sender, blockstore_sender);
+            let res = broadcast_stage_run.run(
+                &cluster_info.keypair(),
+                blockstore,
+                receiver,
+                socket_sender,
+                blockstore_sender,
+            );
             let res = Self::handle_error(res, "run");
             if let Some(res) = res {
                 return res;
@@ -169,15 +198,15 @@ impl BroadcastStage {
     fn handle_error(r: Result<()>, name: &str) -> Option<BroadcastStageReturnType> {
         if let Err(e) = r {
             match e {
-                Error::RecvTimeoutError(RecvTimeoutError::Disconnected)
-                | Error::SendError
-                | Error::RecvError(RecvError)
-                | Error::CrossbeamRecvTimeoutError(CrossbeamRecvTimeoutError::Disconnected) => {
+                Error::RecvTimeout(RecvTimeoutError::Disconnected)
+                | Error::Send
+                | Error::Recv(RecvError)
+                | Error::CrossbeamRecvTimeout(CrossbeamRecvTimeoutError::Disconnected) => {
                     return Some(BroadcastStageReturnType::ChannelDisconnected);
                 }
-                Error::RecvTimeoutError(RecvTimeoutError::Timeout)
-                | Error::CrossbeamRecvTimeoutError(CrossbeamRecvTimeoutError::Timeout) => (),
-                Error::ClusterInfoError(ClusterInfoError::NoPeers) => (), // TODO: Why are the unit-tests throwing hundreds of these?
+                Error::RecvTimeout(RecvTimeoutError::Timeout)
+                | Error::CrossbeamRecvTimeout(CrossbeamRecvTimeoutError::Timeout) => (),
+                Error::ClusterInfo(ClusterInfoError::NoPeers) => (), // TODO: Why are the unit-tests throwing hundreds of these?
                 _ => {
                     inc_new_counter_error!("streamer-broadcaster-error", 1, 1);
                     error!("{} broadcaster error: {:?}", name, e);
@@ -211,6 +240,7 @@ impl BroadcastStage {
         retransmit_slots_receiver: RetransmitSlotsReceiver,
         exit_sender: &Arc<AtomicBool>,
         blockstore: &Arc<Blockstore>,
+        bank_forks: &Arc<RwLock<BankForks>>,
         broadcast_stage_run: impl BroadcastRun + Send + 'static + Clone,
     ) -> Self {
         let btree = blockstore.clone();
@@ -220,29 +250,35 @@ impl BroadcastStage {
         let bs_run = broadcast_stage_run.clone();
 
         let socket_sender_ = socket_sender.clone();
-        let thread_hdl = Builder::new()
-            .name("solana-broadcaster".to_string())
-            .spawn(move || {
-                let _finalizer = Finalizer::new(exit);
-                Self::run(
-                    &btree,
-                    &receiver,
-                    &socket_sender_,
-                    &blockstore_sender,
-                    bs_run,
-                )
-            })
-            .unwrap();
+        let thread_hdl = {
+            let cluster_info = cluster_info.clone();
+            Builder::new()
+                .name("solana-broadcaster".to_string())
+                .spawn(move || {
+                    let _finalizer = Finalizer::new(exit);
+                    Self::run(
+                        cluster_info,
+                        &btree,
+                        &receiver,
+                        &socket_sender_,
+                        &blockstore_sender,
+                        bs_run,
+                    )
+                })
+                .unwrap()
+        };
         let mut thread_hdls = vec![thread_hdl];
         let socket_receiver = Arc::new(Mutex::new(socket_receiver));
         for sock in socks.into_iter() {
             let socket_receiver = socket_receiver.clone();
             let mut bs_transmit = broadcast_stage_run.clone();
             let cluster_info = cluster_info.clone();
+            let bank_forks = bank_forks.clone();
             let t = Builder::new()
                 .name("solana-broadcaster-transmit".to_string())
                 .spawn(move || loop {
-                    let res = bs_transmit.transmit(&socket_receiver, &cluster_info, &sock);
+                    let res =
+                        bs_transmit.transmit(&socket_receiver, &cluster_info, &sock, &bank_forks);
                     let res = Self::handle_error(res, "solana-broadcaster-transmit");
                     if let Some(res) = res {
                         return res;
@@ -305,7 +341,7 @@ impl BroadcastStage {
 
         for (_, bank) in retransmit_slots.iter() {
             let bank_epoch = bank.get_leader_schedule_epoch(bank.slot());
-            let stakes = staking_utils::staked_nodes_at_epoch(&bank, bank_epoch);
+            let stakes = bank.epoch_staked_nodes(bank_epoch);
             let stakes = stakes.map(Arc::new);
             let data_shreds = Arc::new(
                 blockstore
@@ -346,7 +382,8 @@ fn update_peer_stats(
 ) {
     let now = timestamp();
     let last = last_datapoint_submit.load(Ordering::Relaxed);
-    if now - last > 1000
+    #[allow(deprecated)]
+    if now.saturating_sub(last) > 1000
         && last_datapoint_submit.compare_and_swap(last, now, Ordering::Relaxed) == last
     {
         datapoint_info!(
@@ -357,95 +394,70 @@ fn update_peer_stats(
     }
 }
 
-pub fn get_broadcast_peers<S: std::hash::BuildHasher>(
-    cluster_info: &ClusterInfo,
-    stakes: Option<Arc<HashMap<Pubkey, u64, S>>>,
-) -> (Vec<ContactInfo>, Vec<(u64, usize)>) {
-    use crate::cluster_info;
-    let mut peers = cluster_info.tvu_peers();
-    let peers_and_stakes = cluster_info::stake_weight_peers(&mut peers, stakes);
-    (peers, peers_and_stakes)
-}
-
 /// broadcast messages from the leader to layer 1 nodes
 /// # Remarks
 pub fn broadcast_shreds(
     s: &UdpSocket,
-    shreds: &Arc<Vec<Shred>>,
-    peers_and_stakes: &[(u64, usize)],
-    peers: &[ContactInfo],
+    shreds: &[Shred],
+    cluster_nodes: &ClusterNodes<BroadcastStage>,
     last_datapoint_submit: &Arc<AtomicU64>,
     transmit_stats: &mut TransmitShredsStats,
+    self_pubkey: Pubkey,
+    bank_forks: &Arc<RwLock<BankForks>>,
+    socket_addr_space: &SocketAddrSpace,
 ) -> Result<()> {
-    let broadcast_len = peers_and_stakes.len();
+    let mut result = Ok(());
+    let broadcast_len = cluster_nodes.num_peers();
     if broadcast_len == 0 {
         update_peer_stats(1, 1, last_datapoint_submit);
-        return Ok(());
+        return result;
     }
     let mut shred_select = Measure::start("shred_select");
+    let root_bank = bank_forks.read().unwrap().root_bank();
     let packets: Vec<_> = shreds
         .iter()
-        .map(|shred| {
-            let broadcast_index = weighted_best(&peers_and_stakes, shred.seed());
-
-            (&shred.payload, &peers[broadcast_index].tvu)
+        .filter_map(|shred| {
+            let seed = shred.seed(Some(self_pubkey), &root_bank);
+            let node = cluster_nodes.get_broadcast_peer(seed)?;
+            if socket_addr_space.check(&node.tvu) {
+                Some((&shred.payload[..], &node.tvu))
+            } else {
+                None
+            }
         })
         .collect();
     shred_select.stop();
     transmit_stats.shred_select += shred_select.as_us();
 
-    let mut sent = 0;
     let mut send_mmsg_time = Measure::start("send_mmsg");
-    while sent < packets.len() {
-        match send_mmsg(s, &packets[sent..]) {
-            Ok(n) => sent += n,
-            Err(e) => {
-                return Err(Error::IO(e));
-            }
-        }
+    if let Err(SendPktsError::IoError(ioerr, num_failed)) = batch_send(s, &packets[..]) {
+        transmit_stats.dropped_packets += num_failed;
+        result = Err(Error::Io(ioerr));
     }
     send_mmsg_time.stop();
     transmit_stats.send_mmsg_elapsed += send_mmsg_time.as_us();
+    transmit_stats.total_packets += packets.len();
 
-    let num_live_peers = num_live_peers(&peers);
+    let num_live_peers = cluster_nodes.num_peers_live(timestamp()) as i64;
     update_peer_stats(
         num_live_peers,
         broadcast_len as i64 + 1,
         last_datapoint_submit,
     );
-    Ok(())
-}
-
-fn distance(a: u64, b: u64) -> u64 {
-    if a > b {
-        a - b
-    } else {
-        b - a
-    }
-}
-
-fn num_live_peers(peers: &[ContactInfo]) -> i64 {
-    let mut num_live_peers = 1i64;
-    peers.iter().for_each(|p| {
-        // A peer is considered live if they generated their contact info recently
-        if distance(timestamp(), p.wallclock) <= CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS {
-            num_live_peers += 1;
-        }
-    });
-    num_live_peers
+    result
 }
 
 #[cfg(test)]
 pub mod test {
     use super::*;
-    use crate::cluster_info::{ClusterInfo, Node};
     use crossbeam_channel::unbounded;
+    use solana_entry::entry::create_ticks;
+    use solana_gossip::cluster_info::{ClusterInfo, Node};
     use solana_ledger::{
         blockstore::{make_slot_entries, Blockstore},
-        entry::create_ticks,
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
         get_tmp_ledger_path,
-        shred::{max_ticks_per_n_shreds, Shredder, RECOMMENDED_FEC_RATE},
+        shred::{max_ticks_per_n_shreds, ProcessShredsStats, Shredder},
     };
     use solana_runtime::bank::Bank;
     use solana_sdk::{
@@ -470,11 +482,14 @@ pub mod test {
     ) {
         let num_entries = max_ticks_per_n_shreds(num, None);
         let (data_shreds, _) = make_slot_entries(slot, 0, num_entries);
-        let keypair = Arc::new(Keypair::new());
-        let shredder = Shredder::new(slot, 0, RECOMMENDED_FEC_RATE, keypair, 0, 0)
-            .expect("Expected to create a new shredder");
-
-        let coding_shreds = shredder.data_shreds_to_coding_shreds(&data_shreds[0..]);
+        let keypair = Keypair::new();
+        let coding_shreds = Shredder::data_shreds_to_coding_shreds(
+            &keypair,
+            &data_shreds[0..],
+            true, // is_last_in_slot
+            &mut ProcessShredsStats::default(),
+        )
+        .unwrap();
         (
             data_shreds.clone(),
             coding_shreds.clone(),
@@ -513,17 +528,6 @@ pub mod test {
 
         assert_eq!(num_expected_data_shreds, data_index);
         assert_eq!(num_expected_coding_shreds, coding_index);
-    }
-
-    #[test]
-    fn test_num_live_peers() {
-        let mut ci = ContactInfo::default();
-        ci.wallclock = std::u64::MAX;
-        assert_eq!(num_live_peers(&[ci.clone()]), 1);
-        ci.wallclock = timestamp() - 1;
-        assert_eq!(num_live_peers(&[ci.clone()]), 2);
-        ci.wallclock = timestamp() - CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS - 1;
-        assert_eq!(num_live_peers(&[ci]), 1);
     }
 
     #[test]
@@ -599,16 +603,21 @@ pub mod test {
         let broadcast_buddy = Node::new_localhost_with_pubkey(&buddy_keypair.pubkey());
 
         // Fill the cluster_info with the buddy's info
-        let cluster_info = ClusterInfo::new_with_invalid_keypair(leader_info.info.clone());
+        let cluster_info = ClusterInfo::new(
+            leader_info.info.clone(),
+            Arc::new(Keypair::new()),
+            SocketAddrSpace::Unspecified,
+        );
         cluster_info.insert_info(broadcast_buddy.info);
         let cluster_info = Arc::new(cluster_info);
 
         let exit_sender = Arc::new(AtomicBool::new(false));
 
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
-        let bank = Arc::new(Bank::new(&genesis_config));
+        let bank = Bank::new(&genesis_config);
+        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank = bank_forks.read().unwrap().root_bank();
 
-        let leader_keypair = cluster_info.keypair.clone();
         // Start up the broadcast stage
         let broadcast_service = BroadcastStage::new(
             leader_info.sockets.broadcast,
@@ -617,7 +626,8 @@ pub mod test {
             retransmit_slots_receiver,
             &exit_sender,
             &blockstore,
-            StandardBroadcastRun::new(leader_keypair, 0),
+            &bank_forks,
+            StandardBroadcastRun::new(0),
         );
 
         MockBroadcastStage {
@@ -662,8 +672,6 @@ pub mod test {
                 }
             }
 
-            sleep(Duration::from_millis(2000));
-
             trace!(
                 "[broadcast_ledger] max_tick_height: {}, start_tick_height: {}, ticks_per_slot: {}",
                 max_tick_height,
@@ -671,10 +679,17 @@ pub mod test {
                 ticks_per_slot,
             );
 
-            let blockstore = broadcast_service.blockstore;
-            let entries = blockstore
-                .get_slot_entries(slot, 0)
-                .expect("Expect entries to be present");
+            let mut entries = vec![];
+            for _ in 0..10 {
+                entries = broadcast_service
+                    .blockstore
+                    .get_slot_entries(slot, 0)
+                    .expect("Expect entries to be present");
+                if entries.len() >= max_tick_height as usize {
+                    break;
+                }
+                sleep(Duration::from_millis(1000));
+            }
             assert_eq!(entries.len(), max_tick_height as usize);
 
             drop(entry_sender);

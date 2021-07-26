@@ -1,92 +1,172 @@
+/* eslint-disable @typescript-eslint/no-redeclare */
+
 import {
   enums,
-  object,
-  StructType,
+  type,
+  Infer,
   number,
+  string,
   optional,
   array,
+  nullable,
+  union,
 } from "superstruct";
-import { Pubkey } from "validators/pubkey";
+import { PublicKeyFromString } from "validators/pubkey";
 
-const InitializeMint = object({
-  mint: Pubkey,
-  amount: number(),
+export type TokenAmountUi = Infer<typeof TokenAmountUi>;
+export const TokenAmountUi = type({
+  amount: string(),
   decimals: number(),
-  owner: optional(Pubkey),
-  account: optional(Pubkey),
+  uiAmountString: string(),
 });
 
-const InitializeAccount = object({
-  account: Pubkey,
-  mint: Pubkey,
-  owner: Pubkey,
+const InitializeMint = type({
+  mint: PublicKeyFromString,
+  decimals: number(),
+  mintAuthority: PublicKeyFromString,
+  rentSysvar: PublicKeyFromString,
+  freezeAuthority: optional(PublicKeyFromString),
 });
 
-const InitializeMultisig = object({
-  multisig: Pubkey,
-  signers: array(Pubkey),
+const InitializeAccount = type({
+  account: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  owner: PublicKeyFromString,
+  rentSysvar: PublicKeyFromString,
+});
+
+const InitializeMultisig = type({
+  multisig: PublicKeyFromString,
+  rentSysvar: PublicKeyFromString,
+  signers: array(PublicKeyFromString),
   m: number(),
 });
 
-const Transfer = object({
-  source: Pubkey,
-  destination: Pubkey,
-  amount: number(),
-  authority: optional(Pubkey),
-  multisigAuthority: optional(Pubkey),
-  signers: optional(array(Pubkey)),
+export type Transfer = Infer<typeof Transfer>;
+export const Transfer = type({
+  source: PublicKeyFromString,
+  destination: PublicKeyFromString,
+  amount: union([string(), number()]),
+  authority: optional(PublicKeyFromString),
+  multisigAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
 });
 
-const Approve = object({
-  source: Pubkey,
-  delegate: Pubkey,
-  amount: number(),
-  owner: optional(Pubkey),
-  multisigOwner: optional(Pubkey),
-  signers: optional(array(Pubkey)),
+const Approve = type({
+  source: PublicKeyFromString,
+  delegate: PublicKeyFromString,
+  amount: union([string(), number()]),
+  owner: optional(PublicKeyFromString),
+  multisigOwner: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
 });
 
-const Revoke = object({
-  source: Pubkey,
-  owner: optional(Pubkey),
-  multisigOwner: optional(Pubkey),
-  signers: optional(array(Pubkey)),
+const Revoke = type({
+  source: PublicKeyFromString,
+  owner: optional(PublicKeyFromString),
+  multisigOwner: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
 });
 
-const SetOwner = object({
-  owned: Pubkey,
-  newOwner: Pubkey,
-  owner: optional(Pubkey),
-  multisigOwner: optional(Pubkey),
-  signers: optional(array(Pubkey)),
+const AuthorityType = enums([
+  "mintTokens",
+  "freezeAccount",
+  "accountOwner",
+  "closeAccount",
+]);
+
+const SetAuthority = type({
+  mint: optional(PublicKeyFromString),
+  account: optional(PublicKeyFromString),
+  authorityType: AuthorityType,
+  newAuthority: nullable(PublicKeyFromString),
+  authority: optional(PublicKeyFromString),
+  multisigAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
 });
 
-const MintTo = object({
-  mint: Pubkey,
-  account: Pubkey,
-  amount: number(),
-  owner: optional(Pubkey),
-  multisigOwner: optional(Pubkey),
-  signers: optional(array(Pubkey)),
+const MintTo = type({
+  mint: PublicKeyFromString,
+  account: PublicKeyFromString,
+  amount: union([string(), number()]),
+  mintAuthority: optional(PublicKeyFromString),
+  multisigMintAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
 });
 
-const Burn = object({
-  account: Pubkey,
-  amount: number(),
-  authority: optional(Pubkey),
-  multisigAuthority: optional(Pubkey),
-  signers: optional(array(Pubkey)),
+const Burn = type({
+  account: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  amount: union([string(), number()]),
+  authority: optional(PublicKeyFromString),
+  multisigAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
 });
 
-const CloseAccount = object({
-  account: Pubkey,
-  destination: Pubkey,
-  owner: optional(Pubkey),
-  multisigOwner: optional(Pubkey),
-  signers: optional(array(Pubkey)),
+const CloseAccount = type({
+  account: PublicKeyFromString,
+  destination: PublicKeyFromString,
+  owner: optional(PublicKeyFromString),
+  multisigOwner: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
 });
 
-export type TokenInstructionType = StructType<typeof TokenInstructionType>;
+const FreezeAccount = type({
+  account: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  freezeAuthority: optional(PublicKeyFromString),
+  multisigFreezeAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
+});
+
+const ThawAccount = type({
+  account: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  freezeAuthority: optional(PublicKeyFromString),
+  multisigFreezeAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
+});
+
+export type TransferChecked = Infer<typeof TransferChecked>;
+export const TransferChecked = type({
+  source: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  destination: PublicKeyFromString,
+  authority: optional(PublicKeyFromString),
+  multisigAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
+  tokenAmount: TokenAmountUi,
+});
+
+const ApproveChecked = type({
+  source: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  delegate: PublicKeyFromString,
+  owner: optional(PublicKeyFromString),
+  multisigOwner: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
+  tokenAmount: TokenAmountUi,
+});
+
+const MintToChecked = type({
+  account: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  mintAuthority: optional(PublicKeyFromString),
+  multisigMintAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
+  tokenAmount: TokenAmountUi,
+});
+
+const BurnChecked = type({
+  account: PublicKeyFromString,
+  mint: PublicKeyFromString,
+  authority: optional(PublicKeyFromString),
+  multisigAuthority: optional(PublicKeyFromString),
+  signers: optional(array(PublicKeyFromString)),
+  tokenAmount: TokenAmountUi,
+});
+
+export type TokenInstructionType = Infer<typeof TokenInstructionType>;
 export const TokenInstructionType = enums([
   "initializeMint",
   "initializeAccount",
@@ -94,10 +174,20 @@ export const TokenInstructionType = enums([
   "transfer",
   "approve",
   "revoke",
-  "setOwner",
+  "setAuthority",
   "mintTo",
   "burn",
   "closeAccount",
+  "freezeAccount",
+  "thawAccount",
+  "transfer2",
+  "approve2",
+  "mintTo2",
+  "burn2",
+  "transferChecked",
+  "approveChecked",
+  "mintToChecked",
+  "burnChecked",
 ]);
 
 export const IX_STRUCTS = {
@@ -107,10 +197,20 @@ export const IX_STRUCTS = {
   transfer: Transfer,
   approve: Approve,
   revoke: Revoke,
-  setOwner: SetOwner,
+  setAuthority: SetAuthority,
   mintTo: MintTo,
   burn: Burn,
   closeAccount: CloseAccount,
+  freezeAccount: FreezeAccount,
+  thawAccount: ThawAccount,
+  transfer2: TransferChecked,
+  approve2: ApproveChecked,
+  mintTo2: MintToChecked,
+  burn2: BurnChecked,
+  transferChecked: TransferChecked,
+  approveChecked: ApproveChecked,
+  mintToChecked: MintToChecked,
+  burnChecked: BurnChecked,
 };
 
 export const IX_TITLES = {
@@ -120,8 +220,18 @@ export const IX_TITLES = {
   transfer: "Transfer",
   approve: "Approve",
   revoke: "Revoke",
-  setOwner: "Set Owner",
+  setAuthority: "Set Authority",
   mintTo: "Mint To",
   burn: "Burn",
   closeAccount: "Close Account",
+  freezeAccount: "Freeze Account",
+  thawAccount: "Thaw Account",
+  transfer2: "Transfer (Checked)",
+  approve2: "Approve (Checked)",
+  mintTo2: "Mint To (Checked)",
+  burn2: "Burn (Checked)",
+  transferChecked: "Transfer (Checked)",
+  approveChecked: "Approve (Checked)",
+  mintToChecked: "Mint To (Checked)",
+  burnChecked: "Burn (Checked)",
 };

@@ -1,3 +1,5 @@
+#![cfg(feature = "full")]
+
 use solana_sdk::{
     hard_forks::HardForks,
     hash::{extend_and_hash, Hash},
@@ -13,6 +15,8 @@ pub fn version_from_hash(hash: &Hash) -> u16 {
             .for_each(|(accum, seed)| *accum ^= *seed)
     });
     // convert accum into a u16
+    // Because accum[0] is a u8, 8bit left shift of the u16 can never overflow
+    #[allow(clippy::integer_arithmetic)]
     let version = ((accum[0] as u16) << 8) | accum[1] as u16;
 
     // ensure version is never zero, to avoid looking like an uninitialized version

@@ -1,17 +1,18 @@
 #![feature(test)]
+#![allow(clippy::integer_arithmetic)]
 
 extern crate test;
 
 use log::*;
 use solana_runtime::{bank::*, bank_client::BankClient, loader_utils::create_invoke_instruction};
 use solana_sdk::{
-    account::KeyedAccount,
     client::AsyncClient,
     client::SyncClient,
     clock::MAX_RECENT_BLOCKHASHES,
     genesis_config::create_genesis_config,
     instruction::InstructionError,
     message::Message,
+    process_instruction::InvokeContext,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     transaction::Transaction,
@@ -29,10 +30,11 @@ const NOOP_PROGRAM_ID: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
 ];
 
+#[allow(clippy::unnecessary_wraps)]
 fn process_instruction(
     _program_id: &Pubkey,
-    _keyed_accounts: &[KeyedAccount],
     _data: &[u8],
+    _invoke_context: &mut dyn InvokeContext,
 ) -> Result<(), InstructionError> {
     Ok(())
 }
@@ -48,7 +50,7 @@ pub fn create_builtin_transactions(
             // Seed the signer account
             let rando0 = Keypair::new();
             bank_client
-                .transfer_and_confirm(10_000, &mint_keypair, &rando0.pubkey())
+                .transfer_and_confirm(10_000, mint_keypair, &rando0.pubkey())
                 .unwrap_or_else(|_| panic!("{}:{}", line!(), file!()));
 
             let instruction = create_invoke_instruction(rando0.pubkey(), program_id, &1u8);
@@ -70,7 +72,7 @@ pub fn create_native_loader_transactions(
             // Seed the signer account©41
             let rando0 = Keypair::new();
             bank_client
-                .transfer_and_confirm(10_000, &mint_keypair, &rando0.pubkey())
+                .transfer_and_confirm(10_000, mint_keypair, &rando0.pubkey())
                 .unwrap_or_else(|_| panic!("{}:{}", line!(), file!()));
 
             let instruction = create_invoke_instruction(rando0.pubkey(), program_id, &1u8);
@@ -82,7 +84,7 @@ pub fn create_native_loader_transactions(
 }
 
 fn sync_bencher(bank: &Arc<Bank>, _bank_client: &BankClient, transactions: &[Transaction]) {
-    let results = bank.process_transactions(&transactions);
+    let results = bank.process_transactions(transactions.iter());
     assert!(results.iter().all(Result::is_ok));
 }
 
@@ -92,7 +94,7 @@ fn async_bencher(bank: &Arc<Bank>, bank_client: &BankClient, transactions: &[Tra
     }
     for _ in 0..1_000_000_000_u64 {
         if bank
-            .get_signature_status(&transactions.last().unwrap().signatures.get(0).unwrap())
+            .get_signature_status(transactions.last().unwrap().signatures.get(0).unwrap())
             .is_some()
         {
             break;
@@ -100,13 +102,13 @@ fn async_bencher(bank: &Arc<Bank>, bank_client: &BankClient, transactions: &[Tra
         sleep(Duration::from_nanos(1));
     }
     if bank
-        .get_signature_status(&transactions.last().unwrap().signatures.get(0).unwrap())
+        .get_signature_status(transactions.last().unwrap().signatures.get(0).unwrap())
         .unwrap()
         .is_err()
     {
         error!(
             "transaction failed: {:?}",
-            bank.get_signature_status(&transactions.last().unwrap().signatures.get(0).unwrap())
+            bank.get_signature_status(transactions.last().unwrap().signatures.get(0).unwrap())
                 .unwrap()
         );
         panic!();
@@ -123,18 +125,18 @@ fn do_bench_transactions(
     let (mut genesis_config, mint_keypair) = create_genesis_config(100_000_000);
     genesis_config.ticks_per_slot = 100;
     let mut bank = Bank::new(&genesis_config);
-    bank.add_builtin_program(
+    bank.add_builtin(
         "builtin_program",
         Pubkey::new(&BUILTIN_PROGRAM_ID),
         process_instruction,
     );
-    bank.add_native_program("solana_noop_program", &Pubkey::new(&NOOP_PROGRAM_ID));
+    bank.add_native_program("solana_noop_program", &Pubkey::new(&NOOP_PROGRAM_ID), false);
     let bank = Arc::new(bank);
     let bank_client = BankClient::new_shared(&bank);
     let transactions = create_transactions(&bank_client, &mint_keypair);
 
     // Do once to fund accounts, load modules, etc...
-    let results = bank.process_transactions(&transactions);
+    let results = bank.process_transactions(transactions.iter());
     assert!(results.iter().all(Result::is_ok));
 
     bencher.iter(|| {
