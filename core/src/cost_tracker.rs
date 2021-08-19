@@ -5,7 +5,7 @@
 //! - add_transaction_cost(&tx), mutable function to accumulate `tx` cost to tracker.
 //!
 use crate::cost_model::{CostModel, CostModelError, TransactionCost};
-use solana_sdk::{clock::Slot, pubkey::Pubkey, sanitized_transaction::SanitizedTransaction};
+use solana_sdk::{clock::Slot, pubkey::Pubkey, transaction::SanitizedTransaction};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
@@ -176,7 +176,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config(10);
-        let bank = Arc::new(Bank::new_no_wallclock_throttle(&genesis_config));
+        let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
         let start_hash = bank.last_blockhash();
         (mint_keypair, start_hash)
     }

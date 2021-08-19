@@ -160,7 +160,7 @@ impl SnapshotRequestHandler {
                 // accounts that were included in the bank delta hash when the bank was frozen,
                 // and if we clean them here, the newly created snapshot's hash may not match
                 // the frozen hash.
-                snapshot_root_bank.clean_accounts(true, false);
+                snapshot_root_bank.clean_accounts(true, false, None);
                 clean_time.stop();
 
                 if accounts_db_caching_enabled {
@@ -399,7 +399,7 @@ impl AccountsBackgroundService {
                                 // slots >= bank.slot()
                                 bank.force_flush_accounts_cache();
                             }
-                            bank.clean_accounts(true, false);
+                            bank.clean_accounts(true, false, None);
                             last_cleaned_block_height = bank.block_height();
                         }
                     }
@@ -457,7 +457,7 @@ mod test {
     #[test]
     fn test_accounts_background_service_remove_dead_slots() {
         let genesis = create_genesis_config(10);
-        let bank0 = Arc::new(Bank::new(&genesis.genesis_config));
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis.genesis_config));
         let (pruned_banks_sender, pruned_banks_receiver) = unbounded();
         let request_handler = AbsRequestHandler {
             snapshot_request_handler: None,

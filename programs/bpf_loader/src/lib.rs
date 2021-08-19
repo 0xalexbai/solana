@@ -16,9 +16,8 @@ use log::{log_enabled, trace, Level::Trace};
 use solana_measure::measure::Measure;
 use solana_rbpf::{
     aligned_memory::AlignedMemory,
-    ebpf::{HOST_ALIGN, MM_HEAP_START},
+    ebpf::HOST_ALIGN,
     error::{EbpfError, UserDefinedError},
-    memory_region::MemoryRegion,
     static_analysis::Analysis,
     verifier::{self, VerifierError},
     vm::{Config, EbpfVm, Executable, InstructionMeter},
@@ -31,7 +30,7 @@ use solana_sdk::{
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
     clock::Clock,
     entrypoint::{HEAP_LENGTH, SUCCESS},
-    feature_set::{add_missing_program_error_mappings, upgradeable_close_instruction},
+    feature_set::{add_missing_program_error_mappings, stop_verify_mul64_imm_nonzero},
     ic_logger_msg, ic_msg,
     instruction::InstructionError,
     keyed_account::{from_keyed_account, keyed_account_at_index},
@@ -83,6 +82,8 @@ pub fn create_executor(
         max_call_depth: compute_budget.max_call_depth,
         stack_frame_size: compute_budget.stack_frame_size,
         enable_instruction_tracing: log_enabled!(Trace),
+        verify_mul64_imm_nonzero: !invoke_context
+            .is_feature_active(&stop_verify_mul64_imm_nonzero::id()), // TODO: Feature gate and then remove me
         ..Config::default()
     };
     let mut executable = {
@@ -98,10 +99,8 @@ pub fn create_executor(
         )
     }
     .map_err(|e| map_ebpf_error(invoke_context, e))?;
-    let (_, elf_bytes) = executable
-        .get_text_bytes()
-        .map_err(|e| map_ebpf_error(invoke_context, e))?;
-    verifier::check(elf_bytes)
+    let text_bytes = executable.get_text_bytes().1;
+    verifier::check(text_bytes, &config)
         .map_err(|e| map_ebpf_error(invoke_context, EbpfError::UserError(e.into())))?;
     if use_jit {
         if let Err(err) = executable.jit_compile() {
@@ -150,10 +149,9 @@ pub fn create_vm<'a>(
     invoke_context: &'a mut dyn InvokeContext,
 ) -> Result<EbpfVm<'a, BpfError, ThisInstructionMeter>, EbpfError<BpfError>> {
     let compute_budget = invoke_context.get_compute_budget();
-    let heap =
+    let mut heap =
         AlignedMemory::new_with_size(compute_budget.heap_size.unwrap_or(HEAP_LENGTH), HOST_ALIGN);
-    let heap_region = MemoryRegion::new_from_slice(heap.as_slice(), MM_HEAP_START, 0, true);
-    let mut vm = EbpfVm::new(program, parameter_bytes, &[heap_region])?;
+    let mut vm = EbpfVm::new(program, heap.as_slice_mut(), parameter_bytes)?;
     syscalls::bind_syscall_context_objects(loader_id, &mut vm, invoke_context, heap)?;
     Ok(vm)
 }
@@ -620,9 +618,6 @@ fn process_loader_upgradeable_instruction(
             ic_logger_msg!(logger, "New authority {:?}", new_authority);
         }
         UpgradeableLoaderInstruction::Close => {
-            if !invoke_context.is_feature_active(&upgradeable_close_instruction::id()) {
-                return Err(InstructionError::InvalidInstructionData);
-            }
             let close_account = keyed_account_at_index(keyed_accounts, 0)?;
             let recipient_account = keyed_account_at_index(keyed_accounts, 1)?;
             let authority = keyed_account_at_index(keyed_accounts, 2)?;
@@ -864,16 +859,13 @@ mod tests {
         account_utils::StateMut,
         client::SyncClient,
         clock::Clock,
-        compute_budget::ComputeBudget,
         feature_set::FeatureSet,
         genesis_config::create_genesis_config,
         instruction::Instruction,
         instruction::{AccountMeta, InstructionError},
         keyed_account::KeyedAccount,
         message::Message,
-        process_instruction::{
-            InvokeContextStackFrame, MockComputeMeter, MockInvokeContext, MockLogger,
-        },
+        process_instruction::{MockComputeMeter, MockInvokeContext},
         pubkey::Pubkey,
         rent::Rent,
         signature::{Keypair, Signer},
@@ -915,7 +907,8 @@ mod tests {
         )
         .unwrap();
         let mut vm =
-            EbpfVm::<BpfError, TestInstructionMeter>::new(program.as_ref(), input, &[]).unwrap();
+            EbpfVm::<BpfError, TestInstructionMeter>::new(program.as_ref(), &mut [], input)
+                .unwrap();
         let mut instruction_meter = TestInstructionMeter { remaining: 10 };
         vm.execute_program_interpreted(&mut instruction_meter)
             .unwrap();
@@ -927,7 +920,7 @@ mod tests {
         let prog = &[
             0x18, 0x00, 0x00, 0x00, 0x88, 0x77, 0x66, 0x55, // first half of lddw
         ];
-        verifier::check(prog).unwrap();
+        verifier::check(prog, &Config::default()).unwrap();
     }
 
     #[test]
@@ -1123,22 +1116,8 @@ mod tests {
         );
 
         // Case: limited budget
-        let keyed_accounts_range = 0..keyed_accounts.len();
-        let mut invoke_context = MockInvokeContext {
-            invoke_stack: vec![InvokeContextStackFrame {
-                key: Pubkey::default(),
-                keyed_accounts,
-                keyed_accounts_range,
-            }],
-            logger: MockLogger::default(),
-            compute_budget: ComputeBudget::default(),
-            bpf_compute_budget: ComputeBudget::default().into(),
-            compute_meter: MockComputeMeter::default(),
-            programs: vec![],
-            accounts: vec![],
-            sysvars: vec![],
-            disabled_features: vec![].into_iter().collect(),
-        };
+        let mut invoke_context = MockInvokeContext::new(keyed_accounts);
+        invoke_context.compute_meter = MockComputeMeter::default();
         assert_eq!(
             Err(InstructionError::ProgramFailedToComplete),
             process_instruction(&program_key, &[], &mut invoke_context)
@@ -1533,7 +1512,7 @@ mod tests {
     #[test]
     fn test_bpf_loader_upgradeable_deploy_with_max_len() {
         let (genesis_config, mint_keypair) = create_genesis_config(1_000_000_000);
-        let mut bank = Bank::new(&genesis_config);
+        let mut bank = Bank::new_for_tests(&genesis_config);
         bank.feature_set = Arc::new(FeatureSet::all_enabled());
         bank.add_builtin(
             "solana_bpf_loader_upgradeable_program",

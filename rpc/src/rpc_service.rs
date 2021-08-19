@@ -5,8 +5,8 @@ use {
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         rpc::{
-            rpc_accounts::*, rpc_bank::*, rpc_deprecated_v1_7::*, rpc_full::*, rpc_minimal::*,
-            rpc_obsolete_v1_7::*, *,
+            rpc_accounts::*, rpc_bank::*, rpc_deprecated_v1_7::*, rpc_deprecated_v1_8::*,
+            rpc_full::*, rpc_minimal::*, rpc_obsolete_v1_7::*, *,
         },
         rpc_health::*,
         send_transaction_service::{LeaderInfo, SendTransactionService},
@@ -26,7 +26,8 @@ use {
     solana_metrics::inc_new_counter_info,
     solana_poh::poh_recorder::PohRecorder,
     solana_runtime::{
-        bank_forks::BankForks, commitment::BlockCommitmentCache, snapshot_config::SnapshotConfig,
+        bank_forks::BankForks, commitment::BlockCommitmentCache,
+        snapshot_archive_info::SnapshotArchiveInfoGetter, snapshot_config::SnapshotConfig,
         snapshot_utils,
     },
     solana_sdk::{
@@ -41,7 +42,6 @@ use {
         sync::{mpsc::channel, Arc, Mutex, RwLock},
         thread::{self, Builder, JoinHandle},
     },
-    tokio::runtime,
     tokio_util::codec::{BytesCodec, FramedRead},
 };
 
@@ -120,10 +120,8 @@ impl RpcRequestMiddleware {
     }
 
     #[cfg(unix)]
-    async fn open_no_follow(path: impl AsRef<Path>) -> std::io::Result<tokio_02::fs::File> {
-        // Stuck on tokio 0.2 until the jsonrpc crates upgrade
-        use tokio_02::fs::os::unix::OpenOptionsExt;
-        tokio_02::fs::OpenOptions::new()
+    async fn open_no_follow(path: impl AsRef<Path>) -> std::io::Result<tokio::fs::File> {
+        tokio::fs::OpenOptions::new()
             .read(true)
             .write(false)
             .create(false)
@@ -133,10 +131,9 @@ impl RpcRequestMiddleware {
     }
 
     #[cfg(not(unix))]
-    async fn open_no_follow(path: impl AsRef<Path>) -> std::io::Result<tokio_02::fs::File> {
+    async fn open_no_follow(path: impl AsRef<Path>) -> std::io::Result<tokio::fs::File> {
         // TODO: Is there any way to achieve the same on Windows?
-        // Stuck on tokio 0.2 until the jsonrpc crates upgrade
-        tokio_02::fs::File::open(path).await
+        tokio::fs::File::open(path).await
     }
 
     fn process_file_get(&self, path: &str) -> RequestMiddlewareAction {
@@ -309,9 +306,17 @@ impl JsonRpcService {
         )));
 
         let tpu_address = cluster_info.my_contact_info().tpu;
+
+        // sadly, some parts of our current rpc implemention block the jsonrpc's
+        // _socket-listening_ event loop for too long, due to (blocking) long IO or intesive CPU,
+        // causing no further processing of incoming requests and ultimatily innocent clients timing-out.
+        // So create a (shared) multi-threaded event_loop for jsonrpc and set its .threads() to 1,
+        // so that we avoid the single-threaded event loops from being created automatically by
+        // jsonrpc for threads when .threads(N > 1) is given.
         let runtime = Arc::new(
-            runtime::Builder::new_multi_thread()
-                .thread_name("rpc-runtime")
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(rpc_threads)
+                .thread_name("sol-rpc-el")
                 .enable_all()
                 .build()
                 .expect("Runtime"),
@@ -367,7 +372,6 @@ impl JsonRpcService {
             health.clone(),
             cluster_info.clone(),
             genesis_hash,
-            runtime,
             bigtable_ledger_storage,
             optimistically_confirmed_bank,
             largest_accounts_cache,
@@ -392,23 +396,6 @@ impl JsonRpcService {
 
         let ledger_path = ledger_path.to_path_buf();
 
-        // sadly, some parts of our current rpc implemention block the jsonrpc's
-        // _socket-listening_ event loop for too long, due to (blocking) long IO or intesive CPU,
-        // causing no further processing of incoming requests and ultimatily innocent clients timing-out.
-        // So create a (shared) multi-threaded event_loop for jsonrpc and set its .threads() to 1,
-        // so that we avoid the single-threaded event loops from being created automatically by
-        // jsonrpc for threads when .threads(N > 1) is given.
-        let event_loop = {
-            // Stuck on tokio 0.2 until the jsonrpc crates upgrade
-            tokio_02::runtime::Builder::new()
-                .core_threads(rpc_threads)
-                .threaded_scheduler()
-                .enable_all()
-                .thread_name("sol-rpc-el")
-                .build()
-                .unwrap()
-        };
-
         let (close_handle_sender, close_handle_receiver) = channel();
         let thread_hdl = Builder::new()
             .name("solana-jsonrpc".to_string())
@@ -421,6 +408,7 @@ impl JsonRpcService {
                     io.extend_with(rpc_accounts::AccountsDataImpl.to_delegate());
                     io.extend_with(rpc_full::FullImpl.to_delegate());
                     io.extend_with(rpc_deprecated_v1_7::DeprecatedV1_7Impl.to_delegate());
+                    io.extend_with(rpc_deprecated_v1_8::DeprecatedV1_8Impl.to_delegate());
                 }
                 if obsolete_v1_7_api {
                     io.extend_with(rpc_obsolete_v1_7::ObsoleteV1_7Impl.to_delegate());
@@ -436,7 +424,7 @@ impl JsonRpcService {
                     io,
                     move |_req: &hyper::Request<hyper::Body>| request_processor.clone(),
                 )
-                .event_loop_executor(event_loop.handle().clone())
+                .event_loop_executor(runtime.handle().clone())
                 .threads(1)
                 .cors(DomainsValidation::AllowOnly(vec![
                     AccessControlAllowOrigin::Any,
@@ -517,6 +505,7 @@ mod tests {
             io::Write,
             net::{IpAddr, Ipv4Addr},
         },
+        tokio::runtime::Runtime,
     };
 
     #[test]
@@ -528,7 +517,7 @@ mod tests {
         } = create_genesis_config(10_000);
         let exit = Arc::new(AtomicBool::new(false));
         let validator_exit = create_validator_exit(&exit);
-        let bank = Bank::new(&genesis_config);
+        let bank = Bank::new_for_tests(&genesis_config);
         let cluster_info = Arc::new(ClusterInfo::new(
             ContactInfo::default(),
             Arc::new(Keypair::new()),
@@ -585,7 +574,7 @@ mod tests {
             mut genesis_config, ..
         } = create_genesis_config(10_000);
         genesis_config.cluster_type = ClusterType::MainnetBeta;
-        let bank = Bank::new(&genesis_config);
+        let bank = Bank::new_for_tests(&genesis_config);
         Arc::new(RwLock::new(BankForks::new(bank)))
     }
 
@@ -612,7 +601,8 @@ mod tests {
         let rrm_with_snapshot_config = RpcRequestMiddleware::new(
             PathBuf::from("/"),
             Some(SnapshotConfig {
-                snapshot_interval_slots: 0,
+                full_snapshot_archive_interval_slots: 0,
+                incremental_snapshot_archive_interval_slots: u64::MAX,
                 snapshot_package_output_path: PathBuf::from("/"),
                 snapshot_path: PathBuf::from("/"),
                 archive_format: ArchiveFormat::TarBzip2,
@@ -655,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_process_file_get() {
-        let mut runtime = tokio_02::runtime::Runtime::new().unwrap();
+        let runtime = Runtime::new().unwrap();
 
         let ledger_path = get_tmp_ledger_path!();
         std::fs::create_dir(&ledger_path).unwrap();

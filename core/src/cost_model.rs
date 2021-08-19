@@ -9,22 +9,9 @@
 //!
 use crate::execute_cost_table::ExecuteCostTable;
 use log::*;
-use solana_sdk::{pubkey::Pubkey, sanitized_transaction::SanitizedTransaction};
+use solana_ledger::block_cost_limits::*;
+use solana_sdk::{pubkey::Pubkey, transaction::SanitizedTransaction};
 use std::collections::HashMap;
-
-// Guestimated from mainnet-beta data, sigver averages 1us, average read 7us and average write 25us
-const SIGVER_COST: u64 = 1;
-const NON_SIGNED_READONLY_ACCOUNT_ACCESS_COST: u64 = 7;
-const NON_SIGNED_WRITABLE_ACCOUNT_ACCESS_COST: u64 = 25;
-const SIGNED_READONLY_ACCOUNT_ACCESS_COST: u64 =
-    SIGVER_COST + NON_SIGNED_READONLY_ACCOUNT_ACCESS_COST;
-const SIGNED_WRITABLE_ACCOUNT_ACCESS_COST: u64 =
-    SIGVER_COST + NON_SIGNED_WRITABLE_ACCOUNT_ACCESS_COST;
-
-// Sampled from mainnet-beta, the instruction execution timings stats are (in us):
-// min=194, max=62164, avg=8214.49, med=2243
-pub const ACCOUNT_MAX_COST: u64 = 100_000_000;
-pub const BLOCK_MAX_COST: u64 = 2_500_000_000;
 
 const MAX_WRITABLE_ACCOUNTS: usize = 256;
 
@@ -81,7 +68,7 @@ pub struct CostModel {
 
 impl Default for CostModel {
     fn default() -> Self {
-        CostModel::new(ACCOUNT_MAX_COST, BLOCK_MAX_COST)
+        CostModel::new(account_cost_max(), block_cost_max())
     }
 }
 
@@ -134,22 +121,14 @@ impl CostModel {
 
         // calculate account access cost
         let message = transaction.message();
-        message.account_keys.iter().enumerate().for_each(|(i, k)| {
-            let is_signer = message.is_signer(i);
+        message.account_keys_iter().enumerate().for_each(|(i, k)| {
             let is_writable = message.is_writable(i);
 
-            if is_signer && is_writable {
+            if is_writable {
                 self.transaction_cost.writable_accounts.push(*k);
-                self.transaction_cost.account_access_cost += SIGNED_WRITABLE_ACCOUNT_ACCESS_COST;
-            } else if is_signer && !is_writable {
-                self.transaction_cost.account_access_cost += SIGNED_READONLY_ACCOUNT_ACCESS_COST;
-            } else if !is_signer && is_writable {
-                self.transaction_cost.writable_accounts.push(*k);
-                self.transaction_cost.account_access_cost +=
-                    NON_SIGNED_WRITABLE_ACCOUNT_ACCESS_COST;
+                self.transaction_cost.account_access_cost += account_write_cost();
             } else {
-                self.transaction_cost.account_access_cost +=
-                    NON_SIGNED_READONLY_ACCOUNT_ACCESS_COST;
+                self.transaction_cost.account_access_cost += account_read_cost();
             }
         });
         debug!(
@@ -194,10 +173,8 @@ impl CostModel {
     fn find_transaction_cost(&self, transaction: &SanitizedTransaction) -> u64 {
         let mut cost: u64 = 0;
 
-        for instruction in &transaction.message().instructions {
-            let program_id =
-                transaction.message().account_keys[instruction.program_id_index as usize];
-            let instruction_cost = self.find_instruction_cost(&program_id);
+        for (program_id, instruction) in transaction.message().program_instructions_iter() {
+            let instruction_cost = self.find_instruction_cost(program_id);
             trace!(
                 "instruction {:?} has cost of {}",
                 instruction,
@@ -240,7 +217,7 @@ mod tests {
             mint_keypair,
             ..
         } = create_genesis_config(10);
-        let bank = Arc::new(Bank::new_no_wallclock_throttle(&genesis_config));
+        let bank = Arc::new(Bank::new_no_wallclock_throttle_for_tests(&genesis_config));
         let start_hash = bank.last_blockhash();
         (mint_keypair, start_hash)
     }
@@ -411,9 +388,8 @@ mod tests {
                 .try_into()
                 .unwrap();
 
-        let expected_account_cost = SIGNED_WRITABLE_ACCOUNT_ACCESS_COST
-            + NON_SIGNED_WRITABLE_ACCOUNT_ACCESS_COST
-            + NON_SIGNED_READONLY_ACCOUNT_ACCESS_COST;
+        let expected_account_cost =
+            account_write_cost() + account_write_cost() + account_read_cost();
         let expected_execution_cost = 8;
 
         let mut cost_model = CostModel::default();
@@ -468,9 +444,8 @@ mod tests {
         );
 
         let number_threads = 10;
-        let expected_account_cost = SIGNED_WRITABLE_ACCOUNT_ACCESS_COST
-            + NON_SIGNED_WRITABLE_ACCOUNT_ACCESS_COST * 2
-            + NON_SIGNED_READONLY_ACCOUNT_ACCESS_COST * 2;
+        let expected_account_cost =
+            account_write_cost() + account_write_cost() * 2 + account_read_cost() * 2;
         let cost1 = 100;
         let cost2 = 200;
         // execution cost can be either 2 * Default (before write) or cost1+cost2 (after write)

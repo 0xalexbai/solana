@@ -6,8 +6,10 @@ use reqwest::{self, header::CONTENT_TYPE};
 use serde_json::{json, Value};
 use solana_account_decoder::UiAccount;
 use solana_client::{
+    client_error::{ClientErrorKind, Result as ClientResult},
     rpc_client::RpcClient,
     rpc_config::{RpcAccountInfoConfig, RpcSignatureSubscribeConfig},
+    rpc_request::RpcError,
     rpc_response::{Response, RpcSignatureResult, SlotUpdate},
     tpu_client::{TpuClient, TpuClientConfig},
 };
@@ -30,7 +32,7 @@ use std::{
     thread::sleep,
     time::{Duration, Instant},
 };
-use tokio_02::runtime::Runtime;
+use tokio::runtime::Runtime;
 
 macro_rules! json_req {
     ($method: expr, $params: expr) => {{
@@ -169,7 +171,7 @@ fn test_rpc_slot_updates() {
         let connect = ws::try_connect::<PubsubClient>(&rpc_pubsub_url).unwrap();
         let client = connect.await.unwrap();
 
-        tokio_02::spawn(async move {
+        tokio::spawn(async move {
             let mut update_sub = client.slots_updates_subscribe().unwrap();
             loop {
                 let response = update_sub.next().await.unwrap();
@@ -229,7 +231,7 @@ fn test_rpc_subscriptions() {
     transactions_socket.connect(test_validator.tpu()).unwrap();
 
     let rpc_client = RpcClient::new(test_validator.rpc_url());
-    let recent_blockhash = rpc_client.get_recent_blockhash().unwrap().0;
+    let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
 
     // Create transaction signatures to subscribe to
     let transactions: Vec<Transaction> = (0..1000)
@@ -279,7 +281,7 @@ fn test_rpc_subscriptions() {
                 )
                 .unwrap_or_else(|err| panic!("sig sub err: {:#?}", err));
 
-            tokio_02::spawn(async move {
+            tokio::spawn(async move {
                 let response = sig_sub.next().await.unwrap();
                 status_sender
                     .send((sig.clone(), response.unwrap()))
@@ -299,7 +301,7 @@ fn test_rpc_subscriptions() {
                     }),
                 )
                 .unwrap_or_else(|err| panic!("acct sub err: {:#?}", err));
-            tokio_02::spawn(async move {
+            tokio::spawn(async move {
                 let response = client_sub.next().await.unwrap();
                 account_sender.send(response.unwrap()).unwrap();
             });
@@ -309,7 +311,7 @@ fn test_rpc_subscriptions() {
         let mut slot_sub = client
             .slot_subscribe()
             .unwrap_or_else(|err| panic!("sig sub err: {:#?}", err));
-        tokio_02::spawn(async move {
+        tokio::spawn(async move {
             let _response = slot_sub.next().await.unwrap();
             ready_sender.send(()).unwrap();
         });
@@ -404,7 +406,7 @@ fn test_tpu_send_transaction() {
     )
     .unwrap();
 
-    let recent_blockhash = rpc_client.get_recent_blockhash().unwrap().0;
+    let recent_blockhash = rpc_client.get_latest_blockhash().unwrap();
     let tx =
         system_transaction::transfer(&mint_keypair, &Pubkey::new_unique(), 42, recent_blockhash);
     assert!(tpu_client.send_transaction(&tx));
@@ -417,6 +419,37 @@ fn test_tpu_send_transaction() {
         let statuses = rpc_client.get_signature_statuses(&signatures).unwrap();
         if statuses.value.get(0).is_some() {
             return;
+        }
+    }
+}
+
+#[test]
+fn deserialize_rpc_error() -> ClientResult<()> {
+    solana_logger::setup();
+
+    let alice = Keypair::new();
+    let validator = TestValidator::with_no_fees(alice.pubkey(), None, SocketAddrSpace::Unspecified);
+    let rpc_client = RpcClient::new(validator.rpc_url());
+
+    let bob = Keypair::new();
+    let lamports = 50;
+    let blockhash = rpc_client.get_latest_blockhash()?;
+    let mut tx = system_transaction::transfer(&alice, &bob.pubkey(), lamports, blockhash);
+
+    // This will cause an error
+    tx.signatures.clear();
+
+    let err = rpc_client.send_transaction(&tx);
+    let err = err.unwrap_err();
+
+    match err.kind {
+        ClientErrorKind::RpcError(RpcError::RpcRequestError { .. }) => {
+            // This is what used to happen
+            panic!()
+        }
+        ClientErrorKind::RpcError(RpcError::RpcResponseError { .. }) => Ok(()),
+        _ => {
+            panic!()
         }
     }
 }

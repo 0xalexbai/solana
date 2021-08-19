@@ -220,7 +220,7 @@ pub fn cluster_info_retransmit() {
     let retransmit_peers: Vec<_> = peers.iter().collect();
     ClusterInfo::retransmit_to(
         &retransmit_peers,
-        &p,
+        &p.data[..p.meta.size],
         &tn1,
         false,
         &SocketAddrSpace::Unspecified,
@@ -267,7 +267,7 @@ pub fn cluster_info_scale() {
         &vote_keypairs,
         vec![100; vote_keypairs.len()],
     );
-    let bank0 = Bank::new(&genesis_config_info.genesis_config);
+    let bank0 = Bank::new_for_tests(&genesis_config_info.genesis_config);
     let bank_forks = Arc::new(RwLock::new(BankForks::new(bank0)));
 
     let nodes: Vec<_> = vote_keypairs

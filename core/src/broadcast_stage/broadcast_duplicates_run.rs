@@ -1,11 +1,16 @@
-use super::*;
-use solana_entry::entry::Entry;
-use solana_ledger::shred::Shredder;
-use solana_runtime::blockhash_queue::BlockhashQueue;
-use solana_sdk::{
-    hash::Hash,
-    signature::{Keypair, Signer},
-    system_transaction,
+use {
+    super::*,
+    crate::cluster_nodes::ClusterNodesCache,
+    itertools::Itertools,
+    solana_entry::entry::Entry,
+    solana_ledger::shred::Shredder,
+    solana_runtime::blockhash_queue::BlockhashQueue,
+    solana_sdk::{
+        hash::Hash,
+        signature::{Keypair, Signature, Signer},
+        system_transaction,
+    },
+    std::collections::HashSet,
 };
 
 pub const MINIMUM_DUPLICATE_SLOT: Slot = 20;
@@ -32,10 +37,17 @@ pub(super) struct BroadcastDuplicatesRun {
     recent_blockhash: Option<Hash>,
     prev_entry_hash: Option<Hash>,
     num_slots_broadcasted: usize,
+    cluster_nodes_cache: Arc<ClusterNodesCache<BroadcastStage>>,
+    original_last_data_shreds: HashSet<Signature>,
+    partition_last_data_shreds: HashSet<Signature>,
 }
 
 impl BroadcastDuplicatesRun {
     pub(super) fn new(shred_version: u16, config: BroadcastDuplicatesConfig) -> Self {
+        let cluster_nodes_cache = Arc::new(ClusterNodesCache::<BroadcastStage>::new(
+            CLUSTER_NODES_CACHE_NUM_EPOCH_CAP,
+            CLUSTER_NODES_CACHE_TTL,
+        ));
         Self {
             config,
             duplicate_queue: BlockhashQueue::default(),
@@ -47,71 +59,10 @@ impl BroadcastDuplicatesRun {
             recent_blockhash: None,
             prev_entry_hash: None,
             num_slots_broadcasted: 0,
+            cluster_nodes_cache,
+            original_last_data_shreds: HashSet::default(),
+            partition_last_data_shreds: HashSet::default(),
         }
-    }
-
-    fn get_non_partitioned_batches(
-        &self,
-        my_pubkey: &Pubkey,
-        bank: &Bank,
-        data_shreds: Arc<Vec<Shred>>,
-    ) -> TransmitShreds {
-        let bank_epoch = bank.get_leader_schedule_epoch(bank.slot());
-        let mut stakes: HashMap<Pubkey, u64> = bank.epoch_staked_nodes(bank_epoch).unwrap();
-        stakes.retain(|pubkey, _stake| pubkey != my_pubkey);
-        (Some(Arc::new(stakes)), data_shreds)
-    }
-
-    fn get_partitioned_batches(
-        &self,
-        my_pubkey: &Pubkey,
-        bank: &Bank,
-        original_shreds: Arc<Vec<Shred>>,
-        partition_shreds: Arc<Vec<Shred>>,
-    ) -> (TransmitShreds, TransmitShreds) {
-        // On the last shred, partition network with duplicate and real shreds
-        let bank_epoch = bank.get_leader_schedule_epoch(bank.slot());
-        let mut original_recipients = HashMap::new();
-        let mut partition_recipients = HashMap::new();
-
-        let mut stakes: Vec<(Pubkey, u64)> = bank
-            .epoch_staked_nodes(bank_epoch)
-            .unwrap()
-            .into_iter()
-            .filter(|(pubkey, _)| pubkey != my_pubkey)
-            .collect();
-        stakes.sort_by(|(l_key, l_stake), (r_key, r_stake)| {
-            if r_stake == l_stake {
-                l_key.cmp(r_key)
-            } else {
-                l_stake.cmp(r_stake)
-            }
-        });
-
-        let mut cumulative_stake: u64 = 0;
-        for (pubkey, stake) in stakes.into_iter() {
-            cumulative_stake += stake;
-            if cumulative_stake <= self.config.stake_partition {
-                partition_recipients.insert(pubkey, stake);
-            } else {
-                original_recipients.insert(pubkey, stake);
-            }
-        }
-
-        warn!(
-            "{} sent duplicate slot {} to nodes: {:?}",
-            my_pubkey,
-            bank.slot(),
-            &partition_recipients,
-        );
-
-        let original_recipients = Arc::new(original_recipients);
-        let original_transmit_shreds = (Some(original_recipients), original_shreds);
-
-        let partition_recipients = Arc::new(partition_recipients);
-        let partition_transmit_shreds = (Some(partition_recipients), partition_shreds);
-
-        (original_transmit_shreds, partition_transmit_shreds)
     }
 }
 
@@ -143,7 +94,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
         // Update the recent blockhash based on transactions in the entries
         for entry in &receive_results.entries {
             if !entry.transactions.is_empty() {
-                self.recent_blockhash = Some(entry.transactions[0].message.recent_blockhash);
+                self.recent_blockhash = Some(*entry.transactions[0].message.recent_blockhash());
                 break;
             }
         }
@@ -243,8 +194,7 @@ impl BroadcastRun for BroadcastDuplicatesRun {
         blockstore_sender.send((data_shreds.clone(), None))?;
 
         // 3) Start broadcast step
-        let transmit_shreds =
-            self.get_non_partitioned_batches(&keypair.pubkey(), &bank, data_shreds.clone());
+        let transmit_shreds = (bank.slot(), data_shreds.clone());
         info!(
             "{} Sending good shreds for slot {} to network",
             keypair.pubkey(),
@@ -254,19 +204,25 @@ impl BroadcastRun for BroadcastDuplicatesRun {
 
         // Special handling of last shred to cause partition
         if let Some((original_last_data_shred, partition_last_data_shred)) = last_shreds {
+            let pubkey = keypair.pubkey();
+            self.original_last_data_shreds
+                .extend(original_last_data_shred.iter().map(|shred| {
+                    assert!(shred.verify(&pubkey));
+                    shred.signature()
+                }));
+            self.partition_last_data_shreds
+                .extend(partition_last_data_shred.iter().map(|shred| {
+                    assert!(shred.verify(&pubkey));
+                    shred.signature()
+                }));
             let original_last_data_shred = Arc::new(original_last_data_shred);
             let partition_last_data_shred = Arc::new(partition_last_data_shred);
 
             // Store the original shreds that this node replayed
             blockstore_sender.send((original_last_data_shred.clone(), None))?;
 
-            let (original_transmit_shreds, partition_transmit_shreds) = self
-                .get_partitioned_batches(
-                    &keypair.pubkey(),
-                    &bank,
-                    original_last_data_shred,
-                    partition_last_data_shred,
-                );
+            let original_transmit_shreds = (bank.slot(), original_last_data_shred);
+            let partition_transmit_shreds = (bank.slot(), partition_last_data_shred);
 
             socket_sender.send((original_transmit_shreds, None))?;
             socket_sender.send((partition_transmit_shreds, None))?;
@@ -281,23 +237,72 @@ impl BroadcastRun for BroadcastDuplicatesRun {
         sock: &UdpSocket,
         bank_forks: &Arc<RwLock<BankForks>>,
     ) -> Result<()> {
-        let ((stakes, shreds), _) = receiver.lock().unwrap().recv()?;
+        let ((slot, shreds), _) = receiver.lock().unwrap().recv()?;
+        let (root_bank, working_bank) = {
+            let bank_forks = bank_forks.read().unwrap();
+            (bank_forks.root_bank(), bank_forks.working_bank())
+        };
+        let self_pubkey = cluster_info.id();
+        // Creat cluster partition.
+        let cluster_partition: HashSet<Pubkey> = {
+            let mut cumilative_stake = 0;
+            let epoch = root_bank.get_leader_schedule_epoch(slot);
+            root_bank
+                .epoch_staked_nodes(epoch)
+                .unwrap()
+                .iter()
+                .filter(|(pubkey, _)| **pubkey != self_pubkey)
+                .sorted_by_key(|(pubkey, stake)| (**stake, **pubkey))
+                .take_while(|(_, stake)| {
+                    cumilative_stake += *stake;
+                    cumilative_stake <= self.config.stake_partition
+                })
+                .map(|(pubkey, _)| *pubkey)
+                .collect()
+        };
         // Broadcast data
-        let cluster_nodes = ClusterNodes::<BroadcastStage>::new(
-            cluster_info,
-            stakes.as_deref().unwrap_or(&HashMap::default()),
-        );
-        broadcast_shreds(
-            sock,
-            &shreds,
-            &cluster_nodes,
-            &Arc::new(AtomicU64::new(0)),
-            &mut TransmitShredsStats::default(),
-            cluster_info.id(),
-            bank_forks,
-            cluster_info.socket_addr_space(),
-        )?;
-
+        let cluster_nodes =
+            self.cluster_nodes_cache
+                .get(slot, &root_bank, &working_bank, cluster_info);
+        let socket_addr_space = cluster_info.socket_addr_space();
+        let packets: Vec<_> = shreds
+            .iter()
+            .filter_map(|shred| {
+                let seed = shred.seed(Some(self_pubkey), &root_bank);
+                let node = cluster_nodes.get_broadcast_peer(seed)?;
+                if !socket_addr_space.check(&node.tvu) {
+                    return None;
+                }
+                if self.original_last_data_shreds.contains(&shred.signature()) {
+                    // If the node is within the partitin skip the shred.
+                    if cluster_partition.contains(&node.id) {
+                        info!(
+                            "skipping node {} for original shred index {}, slot {}",
+                            node.id,
+                            shred.index(),
+                            shred.slot()
+                        );
+                        return None;
+                    }
+                }
+                if self.partition_last_data_shreds.contains(&shred.signature()) {
+                    // If the node is not within the partitin skip the shred.
+                    if !cluster_partition.contains(&node.id) {
+                        info!(
+                            "skipping node {} for partition shred index {}, slot {}",
+                            node.id,
+                            shred.index(),
+                            shred.slot()
+                        );
+                        return None;
+                    }
+                }
+                Some((&shred.payload, node.tvu))
+            })
+            .collect();
+        if let Err(SendPktsError::IoError(ioerr, _)) = batch_send(sock, &packets) {
+            return Err(Error::Io(ioerr));
+        }
         Ok(())
     }
 

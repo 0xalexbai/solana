@@ -40,7 +40,6 @@ pub mod program_utils;
 pub mod pubkey;
 pub mod recent_blockhashes_account;
 pub mod rpc_port;
-pub mod sanitized_transaction;
 pub mod secp256k1_instruction;
 pub mod shred_version;
 pub mod signature;
@@ -50,6 +49,8 @@ pub mod timing;
 pub mod transaction;
 pub mod transport;
 
+/// Same as `declare_id` except report that this id has been deprecated
+pub use solana_sdk_macro::declare_deprecated_id;
 /// Convenience macro to declare a static public key and functions to interact with it
 ///
 /// Input: a single literal base58 string representation of a program's id

@@ -21,7 +21,7 @@ use crate::{
     shred_fetch_stage::ShredFetchStage,
     sigverify_shreds::ShredSigVerifier,
     sigverify_stage::SigVerifyStage,
-    snapshot_packager_service::PendingSnapshotPackage,
+    tower_storage::TowerStorage,
     voting_service::VotingService,
 };
 use crossbeam_channel::unbounded;
@@ -44,6 +44,7 @@ use solana_runtime::{
     bank_forks::BankForks,
     commitment::BlockCommitmentCache,
     snapshot_config::SnapshotConfig,
+    snapshot_package::PendingSnapshotPackage,
     vote_sender_types::ReplayVoteSender,
 };
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
@@ -114,6 +115,7 @@ impl Tvu {
         rpc_subscriptions: &Arc<RpcSubscriptions>,
         poh_recorder: &Arc<Mutex<PohRecorder>>,
         tower: Tower,
+        tower_storage: Arc<dyn TowerStorage>,
         leader_schedule_cache: &Arc<LeaderScheduleCache>,
         exit: &Arc<AtomicBool>,
         block_commitment_cache: Arc<RwLock<BlockCommitmentCache>>,
@@ -169,15 +171,17 @@ impl Tvu {
         let max_compaction_jitter = tvu_config.rocksdb_max_compaction_jitter;
         let (duplicate_slots_sender, duplicate_slots_receiver) = unbounded();
         let (cluster_slots_update_sender, cluster_slots_update_receiver) = unbounded();
+        let (ancestor_hashes_replay_update_sender, ancestor_hashes_replay_update_receiver) =
+            unbounded();
         let retransmit_stage = RetransmitStage::new(
             bank_forks.clone(),
-            leader_schedule_cache,
+            leader_schedule_cache.clone(),
             blockstore.clone(),
-            cluster_info,
+            cluster_info.clone(),
             Arc::new(retransmit_sockets),
             repair_socket,
             verified_receiver,
-            exit,
+            exit.clone(),
             cluster_slots_update_receiver,
             *bank_forks.read().unwrap().working_bank().epoch_schedule(),
             cfg,
@@ -187,16 +191,17 @@ impl Tvu {
             verified_vote_receiver,
             tvu_config.repair_validators,
             completed_data_sets_sender,
-            max_slots,
+            max_slots.clone(),
             Some(rpc_subscriptions.clone()),
             duplicate_slots_sender,
+            ancestor_hashes_replay_update_receiver,
         );
 
         let (ledger_cleanup_slot_sender, ledger_cleanup_slot_receiver) = channel();
 
         let snapshot_interval_slots = {
             if let Some(config) = bank_forks.read().unwrap().snapshot_config() {
-                config.snapshot_interval_slots
+                config.full_snapshot_archive_interval_slots
             } else {
                 std::u64::MAX
             }
@@ -216,7 +221,7 @@ impl Tvu {
             tvu_config.trusted_validators.clone(),
             tvu_config.halt_on_trusted_validators_accounts_hash_mismatch,
             tvu_config.accounts_hash_fault_injection_slots,
-            snapshot_interval_slots,
+            snapshot_config.clone(),
         );
 
         let (snapshot_request_sender, snapshot_request_handler) = {
@@ -273,11 +278,17 @@ impl Tvu {
             cache_block_meta_sender,
             bank_notification_sender,
             wait_for_vote_to_start_leader: tvu_config.wait_for_vote_to_start_leader,
+            ancestor_hashes_replay_update_sender,
+            tower_storage: tower_storage.clone(),
         };
 
         let (voting_sender, voting_receiver) = channel();
-        let voting_service =
-            VotingService::new(voting_receiver, cluster_info.clone(), poh_recorder.clone());
+        let voting_service = VotingService::new(
+            voting_receiver,
+            cluster_info.clone(),
+            poh_recorder.clone(),
+            tower_storage,
+        );
 
         let (cost_update_sender, cost_update_receiver): (
             Sender<ExecuteTimings>,
@@ -389,7 +400,7 @@ pub mod tests {
         let starting_balance = 10_000;
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(starting_balance);
 
-        let bank_forks = BankForks::new(Bank::new(&genesis_config));
+        let bank_forks = BankForks::new(Bank::new_for_tests(&genesis_config));
 
         //start cluster_info1
         let cluster_info1 = ClusterInfo::new(
@@ -445,6 +456,7 @@ pub mod tests {
             )),
             &poh_recorder,
             tower,
+            Arc::new(crate::tower_storage::FileTowerStorage::default()),
             &leader_schedule_cache,
             &exit,
             block_commitment_cache,

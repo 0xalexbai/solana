@@ -1,6 +1,8 @@
 //! The solana-program-test provides a BanksClient-based test framework BPF programs
 #![allow(clippy::integer_arithmetic)]
 
+#[allow(deprecated)]
+use solana_sdk::sysvar::fees::Fees;
 use {
     async_trait::async_trait,
     chrono_humanize::{Accuracy, HumanTime, Tense},
@@ -34,7 +36,7 @@ use {
         signature::{Keypair, Signer},
         sysvar::{
             clock, epoch_schedule,
-            fees::{self, Fees},
+            fees::{self},
             rent, Sysvar,
         },
     },
@@ -377,6 +379,7 @@ impl solana_sdk::program_stubs::SyscallStubs for SyscallStubs {
         get_sysvar::<EpochSchedule>(&epoch_schedule::id(), var_addr)
     }
 
+    #[allow(deprecated)]
     fn sol_get_fees_sysvar(&self, var_addr: *mut u8) -> u64 {
         get_sysvar::<Fees>(&fees::id(), var_addr)
     }
@@ -448,12 +451,12 @@ fn setup_fee_calculator(bank: Bank) -> Bank {
     }
     let last_blockhash = bank.last_blockhash();
     // Make sure the new last_blockhash now requires a fee
-    assert_ne!(
-        bank.get_fee_calculator(&last_blockhash)
-            .expect("fee_calculator")
-            .lamports_per_signature,
-        0
-    );
+    #[allow(deprecated)]
+    let lamports_per_signature = bank
+        .get_fee_calculator(&last_blockhash)
+        .expect("fee_calculator")
+        .lamports_per_signature;
+    assert_ne!(lamports_per_signature, 0);
 
     bank
 }
@@ -751,7 +754,7 @@ impl ProgramTest {
         debug!("Payer address: {}", mint_keypair.pubkey());
         debug!("Genesis config: {}", genesis_config);
 
-        let mut bank = Bank::new(&genesis_config);
+        let mut bank = Bank::new_for_tests(&genesis_config);
 
         // Add loaders
         macro_rules! add_builtin {

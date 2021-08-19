@@ -1,96 +1,104 @@
 //! The `validator` module hosts all the validator microservices.
 
-use crate::{
-    broadcast_stage::BroadcastStageType,
-    cache_block_meta_service::{CacheBlockMetaSender, CacheBlockMetaService},
-    cluster_info_vote_listener::VoteTracker,
-    completed_data_sets_service::CompletedDataSetsService,
-    consensus::{reconcile_blockstore_roots_with_tower, Tower},
-    cost_model::CostModel,
-    rewards_recorder_service::{RewardsRecorderSender, RewardsRecorderService},
-    sample_performance_service::SamplePerformanceService,
-    serve_repair::ServeRepair,
-    serve_repair_service::ServeRepairService,
-    sigverify,
-    snapshot_packager_service::{PendingSnapshotPackage, SnapshotPackagerService},
-    tpu::{Tpu, DEFAULT_TPU_COALESCE_MS},
-    tvu::{Sockets, Tvu, TvuConfig},
-};
-use crossbeam_channel::{bounded, unbounded};
-use rand::{thread_rng, Rng};
-use solana_entry::poh::compute_hash_time_ns;
-use solana_gossip::{
-    cluster_info::{
-        ClusterInfo, Node, DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
-        DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS,
+use {
+    crate::{
+        broadcast_stage::BroadcastStageType,
+        cache_block_meta_service::{CacheBlockMetaSender, CacheBlockMetaService},
+        cluster_info_vote_listener::VoteTracker,
+        completed_data_sets_service::CompletedDataSetsService,
+        consensus::{reconcile_blockstore_roots_with_tower, Tower},
+        cost_model::CostModel,
+        rewards_recorder_service::{RewardsRecorderSender, RewardsRecorderService},
+        sample_performance_service::SamplePerformanceService,
+        serve_repair::ServeRepair,
+        serve_repair_service::ServeRepairService,
+        sigverify,
+        snapshot_packager_service::SnapshotPackagerService,
+        tower_storage::TowerStorage,
+        tpu::{Tpu, DEFAULT_TPU_COALESCE_MS},
+        tvu::{Sockets, Tvu, TvuConfig},
     },
-    contact_info::ContactInfo,
-    gossip_service::GossipService,
-};
-use solana_ledger::{
-    bank_forks_utils,
-    blockstore::{Blockstore, BlockstoreSignals, CompletedSlotsReceiver, PurgeType},
-    blockstore_db::BlockstoreRecoveryMode,
-    blockstore_processor::{self, TransactionStatusSender},
-    leader_schedule::FixedSchedule,
-    leader_schedule_cache::LeaderScheduleCache,
-};
-use solana_measure::measure::Measure;
-use solana_metrics::datapoint_info;
-use solana_poh::{
-    poh_recorder::{PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
-    poh_service::{self, PohService},
-};
-use solana_rpc::{
-    max_slots::MaxSlots,
-    optimistically_confirmed_bank_tracker::{
-        OptimisticallyConfirmedBank, OptimisticallyConfirmedBankTracker,
+    crossbeam_channel::{bounded, unbounded},
+    rand::{thread_rng, Rng},
+    solana_entry::poh::compute_hash_time_ns,
+    solana_gossip::{
+        cluster_info::{
+            ClusterInfo, Node, DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
+            DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS,
+        },
+        contact_info::ContactInfo,
+        crds_gossip_pull::CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
+        gossip_service::GossipService,
     },
-    rpc::JsonRpcConfig,
-    rpc_completed_slots_service::RpcCompletedSlotsService,
-    rpc_pubsub_service::{PubSubConfig, PubSubService},
-    rpc_service::JsonRpcService,
-    rpc_subscriptions::RpcSubscriptions,
-    transaction_status_service::TransactionStatusService,
-};
-use solana_runtime::{
-    accounts_db::AccountShrinkThreshold,
-    accounts_index::AccountSecondaryIndexes,
-    bank::Bank,
-    bank_forks::BankForks,
-    commitment::BlockCommitmentCache,
-    hardened_unpack::{open_genesis_config, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE},
-    snapshot_config::SnapshotConfig,
-};
-use solana_sdk::{
-    clock::Slot,
-    epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
-    exit::Exit,
-    genesis_config::GenesisConfig,
-    hash::Hash,
-    pubkey::Pubkey,
-    shred_version::compute_shred_version,
-    signature::{Keypair, Signer},
-    timing::timestamp,
-};
-use solana_streamer::socket::SocketAddrSpace;
-use solana_vote_program::vote_state::VoteState;
-use std::{
-    collections::HashSet,
-    net::SocketAddr,
-    ops::Deref,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
-    sync::mpsc::Receiver,
-    sync::{Arc, Mutex, RwLock},
-    thread::{sleep, Builder, JoinHandle},
-    time::{Duration, Instant},
+    solana_ledger::{
+        bank_forks_utils,
+        blockstore::{Blockstore, BlockstoreSignals, CompletedSlotsReceiver, PurgeType},
+        blockstore_db::BlockstoreRecoveryMode,
+        blockstore_processor::{self, TransactionStatusSender},
+        leader_schedule::FixedSchedule,
+        leader_schedule_cache::LeaderScheduleCache,
+    },
+    solana_measure::measure::Measure,
+    solana_metrics::datapoint_info,
+    solana_poh::{
+        poh_recorder::{PohRecorder, GRACE_TICKS_FACTOR, MAX_GRACE_SLOTS},
+        poh_service::{self, PohService},
+    },
+    solana_rpc::{
+        max_slots::MaxSlots,
+        optimistically_confirmed_bank_tracker::{
+            OptimisticallyConfirmedBank, OptimisticallyConfirmedBankTracker,
+        },
+        rpc::JsonRpcConfig,
+        rpc_completed_slots_service::RpcCompletedSlotsService,
+        rpc_pubsub_service::{PubSubConfig, PubSubService},
+        rpc_service::JsonRpcService,
+        rpc_subscriptions::RpcSubscriptions,
+        transaction_status_service::TransactionStatusService,
+    },
+    solana_runtime::{
+        accounts_db::AccountShrinkThreshold,
+        accounts_index::{AccountSecondaryIndexes, AccountsIndexConfig},
+        bank::Bank,
+        bank_forks::BankForks,
+        commitment::BlockCommitmentCache,
+        hardened_unpack::{open_genesis_config, MAX_GENESIS_ARCHIVE_UNPACKED_SIZE},
+        snapshot_archive_info::SnapshotArchiveInfoGetter,
+        snapshot_config::SnapshotConfig,
+        snapshot_package::PendingSnapshotPackage,
+        snapshot_utils,
+    },
+    solana_sdk::{
+        clock::Slot,
+        epoch_schedule::MAX_LEADER_SCHEDULE_EPOCH_OFFSET,
+        exit::Exit,
+        genesis_config::GenesisConfig,
+        hash::Hash,
+        pubkey::Pubkey,
+        shred_version::compute_shred_version,
+        signature::{Keypair, Signer},
+        timing::timestamp,
+    },
+    solana_streamer::socket::SocketAddrSpace,
+    solana_vote_program::vote_state::VoteState,
+    std::{
+        collections::{HashMap, HashSet},
+        net::SocketAddr,
+        ops::Deref,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc::Receiver,
+            Arc, Mutex, RwLock,
+        },
+        thread::{sleep, Builder, JoinHandle},
+        time::{Duration, Instant},
+    },
 };
 
 const MAX_COMPLETED_DATA_SETS_IN_CHANNEL: usize = 100_000;
 const WAIT_FOR_SUPERMAJORITY_THRESHOLD_PERCENT: u64 = 90;
 
-#[derive(Debug)]
 pub struct ValidatorConfig {
     pub dev_halt_at_slot: Option<Slot>,
     pub expected_genesis_hash: Option<Hash>,
@@ -123,9 +131,8 @@ pub struct ValidatorConfig {
     pub max_genesis_archive_unpacked_size: u64,
     pub wal_recovery_mode: Option<BlockstoreRecoveryMode>,
     pub poh_verify: bool, // Perform PoH verification during blockstore processing at boo
-    pub cuda: bool,
     pub require_tower: bool,
-    pub tower_path: Option<PathBuf>,
+    pub tower_storage: Arc<dyn TowerStorage>,
     pub debug_keys: Option<Arc<HashSet<Pubkey>>>,
     pub contact_debug_interval: u64,
     pub contact_save_interval: u64,
@@ -137,8 +144,10 @@ pub struct ValidatorConfig {
     pub poh_hashes_per_batch: u64,
     pub account_indexes: AccountSecondaryIndexes,
     pub accounts_db_caching_enabled: bool,
+    pub accounts_index_config: Option<AccountsIndexConfig>,
     pub warp_slot: Option<Slot>,
     pub accounts_db_test_hash_calculation: bool,
+    pub accounts_db_skip_shrink: bool,
     pub accounts_db_use_index_hash_calculation: bool,
     pub tpu_coalesce_ms: u64,
     pub validator_exit: Arc<RwLock<Exit>>,
@@ -180,9 +189,8 @@ impl Default for ValidatorConfig {
             max_genesis_archive_unpacked_size: MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
             wal_recovery_mode: None,
             poh_verify: true,
-            cuda: false,
             require_tower: false,
-            tower_path: None,
+            tower_storage: Arc::new(crate::tower_storage::NullTowerStorage::default()),
             debug_keys: None,
             contact_debug_interval: DEFAULT_CONTACT_DEBUG_INTERVAL_MILLIS,
             contact_save_interval: DEFAULT_CONTACT_SAVE_INTERVAL_MILLIS,
@@ -196,11 +204,13 @@ impl Default for ValidatorConfig {
             accounts_db_caching_enabled: false,
             warp_slot: None,
             accounts_db_test_hash_calculation: false,
+            accounts_db_skip_shrink: false,
             accounts_db_use_index_hash_calculation: true,
             tpu_coalesce_ms: DEFAULT_TPU_COALESCE_MS,
             validator_exit: Arc::new(RwLock::new(Exit::default())),
             no_wait_for_vote_to_start_leader: true,
             accounts_shrink_ratio: AccountShrinkThreshold::default(),
+            accounts_index_config: None,
         }
     }
 }
@@ -306,8 +316,6 @@ impl Validator {
                 warn!("authorized voter: {}", authorized_voter_keypair.pubkey());
             }
         }
-
-        report_target_features();
 
         for cluster_entrypoint in &cluster_entrypoints {
             info!("entrypoint: {:?}", cluster_entrypoint);
@@ -612,7 +620,7 @@ impl Validator {
         let (snapshot_packager_service, snapshot_config_and_pending_package) =
             if let Some(snapshot_config) = config.snapshot_config.clone() {
                 if is_snapshot_config_invalid(
-                    snapshot_config.snapshot_interval_slots,
+                    snapshot_config.full_snapshot_archive_interval_slots,
                     config.accounts_hash_interval_slots,
                 ) {
                     error!("Snapshot config is invalid");
@@ -717,6 +725,7 @@ impl Validator {
             &rpc_subscriptions,
             &poh_recorder,
             tower,
+            config.tower_storage.clone(),
             &leader_schedule_cache,
             &exit,
             block_commitment_cache,
@@ -951,7 +960,6 @@ fn post_process_restored_tower(
     validator_identity: &Pubkey,
     vote_account: &Pubkey,
     config: &ValidatorConfig,
-    tower_path: &Path,
     bank_forks: &BankForks,
 ) -> Tower {
     let mut should_require_tower = config.require_tower;
@@ -1030,7 +1038,6 @@ fn post_process_restored_tower(
 
             Tower::new_from_bankforks(
                 bank_forks,
-                tower_path,
                 validator_identity,
                 vote_account,
             )
@@ -1098,9 +1105,7 @@ fn new_banks_from_ledger(
     .expect("Failed to open ledger database");
     blockstore.set_no_compaction(config.no_rocksdb_compaction);
 
-    let tower_path = config.tower_path.as_deref().unwrap_or(ledger_path);
-
-    let restored_tower = Tower::restore(tower_path, validator_identity);
+    let restored_tower = Tower::restore(config.tower_storage.as_ref(), validator_identity);
     if let Ok(tower) = &restored_tower {
         reconcile_blockstore_roots_with_tower(tower, &blockstore).unwrap_or_else(|err| {
             error!("Failed to reconcile blockstore with tower: {:?}", err);
@@ -1134,7 +1139,10 @@ fn new_banks_from_ledger(
         debug_keys: config.debug_keys.clone(),
         account_indexes: config.account_indexes.clone(),
         accounts_db_caching_enabled: config.accounts_db_caching_enabled,
+        accounts_index_config: config.accounts_index_config,
         shrink_ratio: config.accounts_shrink_ratio,
+        accounts_db_test_hash_calculation: config.accounts_db_test_hash_calculation,
+        accounts_db_skip_shrink: config.accounts_db_skip_shrink,
         ..blockstore_processor::ProcessOptions::default()
     };
 
@@ -1198,7 +1206,7 @@ fn new_banks_from_ledger(
         );
         leader_schedule_cache.set_root(&bank_forks.root_bank());
 
-        let archive_file = solana_runtime::snapshot_utils::bank_to_full_snapshot_archive(
+        let full_snapshot_archive_info = snapshot_utils::bank_to_full_snapshot_archive(
             ledger_path,
             &bank_forks.root_bank(),
             None,
@@ -1211,7 +1219,10 @@ fn new_banks_from_ledger(
             error!("Unable to create snapshot: {}", err);
             abort();
         });
-        info!("created snapshot: {}", archive_file.display());
+        info!(
+            "created snapshot: {}",
+            full_snapshot_archive_info.path().display()
+        );
     }
 
     let tower = post_process_restored_tower(
@@ -1219,7 +1230,6 @@ fn new_banks_from_ledger(
         validator_identity,
         vote_account,
         config,
-        tower_path,
         &bank_forks,
     );
 
@@ -1438,7 +1448,26 @@ fn wait_for_supermajority(
     Ok(true)
 }
 
-fn report_target_features() {
+fn is_rosetta_emulated() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use std::str::FromStr;
+        std::process::Command::new("sysctl")
+            .args(&["-in", "sysctl.proc_translated"])
+            .output()
+            .map_err(|_| ())
+            .and_then(|output| String::from_utf8(output.stdout).map_err(|_| ()))
+            .and_then(|stdout| u8::from_str(stdout.trim()).map_err(|_| ()))
+            .map(|enabled| enabled == 1)
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+pub fn report_target_features() {
     warn!(
         "CUDA is {}abled",
         if solana_perf::perf_libs::api().is_some() {
@@ -1448,39 +1477,46 @@ fn report_target_features() {
         }
     );
 
-    // We exclude Mac OS here to be compatible with computers that have Mac M1 chips.
-    // For these computers, one must install rust/cargo/brew etc. using Rosetta 2,
-    // which allows them to run software targeted for x86_64 on an aarch64.
-    // Hence the code below will run on these machines (target_arch="x86_64")
-    // if we don't exclude with target_os="macos".
-    //
-    // It's going to require more more work to get Solana building
-    // on Mac M1's without Rosetta,
-    // and when that happens we should remove this
-    // (the feature flag for code targeting that is target_arch="aarch64")
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        not(target_os = "macos")
-    ))]
-    {
+    if !is_rosetta_emulated() {
         unsafe { check_avx() };
+        unsafe { check_avx2() };
     }
 }
 
 // Validator binaries built on a machine with AVX support will generate invalid opcodes
 // when run on machines without AVX causing a non-obvious process abort.  Instead detect
 // the mismatch and error cleanly.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx")]
 unsafe fn check_avx() {
     if is_x86_feature_detected!("avx") {
         info!("AVX detected");
     } else {
         error!(
-            "Your machine does not have AVX support, please rebuild from source on your machine"
+            "Incompatible CPU detected: missing AVX support. Please build from source on the target"
         );
         abort();
     }
 }
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn check_avx() {}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn check_avx2() {
+    if is_x86_feature_detected!("avx2") {
+        info!("AVX2 detected");
+    } else {
+        error!(
+            "Incompatible CPU detected: missing AVX2 support. Please build from source on the target"
+        );
+        abort();
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+unsafe fn check_avx2() {}
 
 // Get the activated stake percentage (based on the provided bank) that is visible in gossip
 fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: bool) -> u64 {
@@ -1491,7 +1527,20 @@ fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: boo
     let mut offline_nodes = vec![];
 
     let mut total_activated_stake = 0;
-    let all_tvu_peers = cluster_info.all_tvu_peers();
+    let now = timestamp();
+    // Nodes contact infos are saved to disk and restored on validator startup.
+    // Staked nodes entries will not expire until an epoch after. So it
+    // is necessary here to filter for recent entries to establish liveness.
+    let peers: HashMap<_, _> = cluster_info
+        .all_tvu_peers()
+        .into_iter()
+        .filter(|node| {
+            let age = now.saturating_sub(node.wallclock);
+            // Contact infos are refreshed twice during this period.
+            age < CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS
+        })
+        .map(|node| (node.id, node))
+        .collect();
     let my_shred_version = cluster_info.my_shred_version();
     let my_id = cluster_info.id();
 
@@ -1507,10 +1556,7 @@ fn get_stake_percent_in_gossip(bank: &Bank, cluster_info: &ClusterInfo, log: boo
             .map(|vote_state| vote_state.node_pubkey)
             .unwrap_or_default();
 
-        if let Some(peer) = all_tvu_peers
-            .iter()
-            .find(|peer| peer.id == vote_state_node_pubkey)
-        {
+        if let Some(peer) = peers.get(&vote_state_node_pubkey) {
             if peer.shred_version == my_shred_version {
                 trace!(
                     "observed {} in gossip, (activated_stake={})",
@@ -1733,7 +1779,7 @@ mod tests {
         );
 
         let (genesis_config, _mint_keypair) = create_genesis_config(1);
-        let bank = Arc::new(Bank::new(&genesis_config));
+        let bank = Arc::new(Bank::new_for_tests(&genesis_config));
         let mut config = ValidatorConfig::default();
         let rpc_override_health_check = Arc::new(AtomicBool::new(false));
         let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));

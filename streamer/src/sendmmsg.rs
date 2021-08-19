@@ -1,8 +1,21 @@
 //! The `sendmmsg` module provides sendmmsg() API implementation
 
-use std::io;
-use std::net::{SocketAddr, UdpSocket};
-use thiserror::Error;
+#[cfg(target_os = "linux")]
+use {
+    itertools::izip,
+    libc::{iovec, mmsghdr, sockaddr_in, sockaddr_in6, sockaddr_storage},
+    nix::sys::socket::InetAddr,
+    std::os::unix::io::AsRawFd,
+};
+use {
+    std::{
+        borrow::Borrow,
+        io,
+        iter::repeat,
+        net::{SocketAddr, UdpSocket},
+    },
+    thiserror::Error,
+};
 
 #[derive(Debug, Error)]
 pub enum SendPktsError {
@@ -12,11 +25,15 @@ pub enum SendPktsError {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn batch_send(sock: &UdpSocket, packets: &[(&[u8], &SocketAddr)]) -> Result<(), SendPktsError> {
+pub fn batch_send<S, T>(sock: &UdpSocket, packets: &[(T, S)]) -> Result<(), SendPktsError>
+where
+    S: Borrow<SocketAddr>,
+    T: AsRef<[u8]>,
+{
     let mut num_failed = 0;
     let mut erropt = None;
     for (p, a) in packets {
-        if let Err(e) = sock.send_to(p, *a) {
+        if let Err(e) = sock.send_to(p.as_ref(), a.borrow()) {
             num_failed += 1;
             if erropt.is_none() {
                 erropt = Some(e);
@@ -32,77 +49,49 @@ pub fn batch_send(sock: &UdpSocket, packets: &[(&[u8], &SocketAddr)]) -> Result<
 }
 
 #[cfg(target_os = "linux")]
-use libc::{iovec, mmsghdr, sockaddr_in, sockaddr_in6, sockaddr_storage};
-
-#[cfg(target_os = "linux")]
 fn mmsghdr_for_packet(
     packet: &[u8],
     dest: &SocketAddr,
-    iovs: &mut Vec<iovec>,
-    addrs: &mut Vec<sockaddr_storage>,
-    hdrs: &mut Vec<mmsghdr>,
+    iov: &mut iovec,
+    addr: &mut sockaddr_storage,
+    hdr: &mut mmsghdr,
 ) {
-    use libc::c_void;
-    use nix::sys::socket::InetAddr;
-    use std::mem;
+    const SIZE_OF_SOCKADDR_IN: usize = std::mem::size_of::<sockaddr_in>();
+    const SIZE_OF_SOCKADDR_IN6: usize = std::mem::size_of::<sockaddr_in6>();
 
-    const SIZE_OF_SOCKADDR_IN: usize = mem::size_of::<sockaddr_in>();
-    const SIZE_OF_SOCKADDR_IN6: usize = mem::size_of::<sockaddr_in6>();
-
-    let index = hdrs.len();
-
-    debug_assert!(index < hdrs.capacity());
-    debug_assert!(index < addrs.capacity());
-    debug_assert!(index < iovs.capacity());
-    debug_assert_eq!(hdrs.len(), addrs.len());
-    debug_assert_eq!(hdrs.len(), iovs.len());
-
-    iovs.push(iovec {
-        iov_base: packet.as_ptr() as *mut c_void,
+    *iov = iovec {
+        iov_base: packet.as_ptr() as *mut libc::c_void,
         iov_len: packet.len(),
-    });
-
-    let hdr: mmsghdr = unsafe { mem::zeroed() };
-    hdrs.push(hdr);
-
-    let addr_storage: sockaddr_storage = unsafe { mem::zeroed() };
-    addrs.push(addr_storage);
-
-    debug_assert!(index < hdrs.len());
-
-    hdrs[index].msg_hdr.msg_iov = &mut iovs[index];
-    hdrs[index].msg_hdr.msg_iovlen = 1;
+    };
+    hdr.msg_hdr.msg_iov = iov;
+    hdr.msg_hdr.msg_iovlen = 1;
+    hdr.msg_hdr.msg_name = addr as *mut _ as *mut _;
 
     match InetAddr::from_std(dest) {
-        InetAddr::V4(addr) => {
+        InetAddr::V4(dest) => {
             unsafe {
-                core::ptr::write(&mut addrs[index] as *mut _ as *mut _, addr);
+                std::ptr::write(addr as *mut _ as *mut _, dest);
             }
-            hdrs[index].msg_hdr.msg_name = &mut addrs[index] as *mut _ as *mut _;
-            hdrs[index].msg_hdr.msg_namelen = SIZE_OF_SOCKADDR_IN as u32;
+            hdr.msg_hdr.msg_namelen = SIZE_OF_SOCKADDR_IN as u32;
         }
-        InetAddr::V6(addr) => {
+        InetAddr::V6(dest) => {
             unsafe {
-                core::ptr::write(&mut addrs[index] as *mut _ as *mut _, addr);
+                std::ptr::write(addr as *mut _ as *mut _, dest);
             }
-            hdrs[index].msg_hdr.msg_name = &mut addrs[index] as *mut _ as *mut _;
-            hdrs[index].msg_hdr.msg_namelen = SIZE_OF_SOCKADDR_IN6 as u32;
+            hdr.msg_hdr.msg_namelen = SIZE_OF_SOCKADDR_IN6 as u32;
         }
     };
 }
 
 #[cfg(target_os = "linux")]
 fn sendmmsg_retry(sock: &UdpSocket, hdrs: &mut Vec<mmsghdr>) -> Result<(), SendPktsError> {
-    use libc::sendmmsg;
-    use std::os::unix::io::AsRawFd;
-
     let sock_fd = sock.as_raw_fd();
     let mut total_sent = 0;
     let mut erropt = None;
 
     let mut pkts = &mut hdrs[..];
     while !pkts.is_empty() {
-        let npkts = match unsafe { sendmmsg(sock_fd, &mut pkts[0], pkts.len() as u32, 0) } {
+        let npkts = match unsafe { libc::sendmmsg(sock_fd, &mut pkts[0], pkts.len() as u32, 0) } {
             -1 => {
                 if erropt.is_none() {
                     erropt = Some(io::Error::last_os_error());
@@ -128,27 +117,34 @@ fn sendmmsg_retry(sock: &UdpSocket, hdrs: &mut Vec<mmsghdr>) -> Result<(), SendP
 }
 
 #[cfg(target_os = "linux")]
-pub fn batch_send(sock: &UdpSocket, packets: &[(&[u8], &SocketAddr)]) -> Result<(), SendPktsError> {
-    // The vectors are allocated with capacity, as later code inserts elements
-    // at specific indices, and uses the address of the vector index in hdrs
-    let mut iovs: Vec<iovec> = Vec::with_capacity(packets.len());
-    let mut addrs: Vec<sockaddr_storage> = Vec::with_capacity(packets.len());
-    let mut hdrs: Vec<mmsghdr> = Vec::with_capacity(packets.len());
-
-    for (pkt, dest) in packets.iter() {
-        mmsghdr_for_packet(pkt, dest, &mut iovs, &mut addrs, &mut hdrs);
+pub fn batch_send<S, T>(sock: &UdpSocket, packets: &[(T, S)]) -> Result<(), SendPktsError>
+where
+    S: Borrow<SocketAddr>,
+    T: AsRef<[u8]>,
+{
+    let size = packets.len();
+    #[allow(clippy::uninit_assumed_init)]
+    let mut iovs = vec![unsafe { std::mem::MaybeUninit::uninit().assume_init() }; size];
+    let mut addrs = vec![unsafe { std::mem::zeroed() }; size];
+    let mut hdrs = vec![unsafe { std::mem::zeroed() }; size];
+    for ((pkt, dest), hdr, iov, addr) in izip!(packets, &mut hdrs, &mut iovs, &mut addrs) {
+        mmsghdr_for_packet(pkt.as_ref(), dest.borrow(), iov, addr, hdr);
     }
-
     sendmmsg_retry(sock, &mut hdrs)
 }
 
-pub fn multi_target_send(
+pub fn multi_target_send<S, T>(
     sock: &UdpSocket,
-    packet: &[u8],
-    dests: &[&SocketAddr],
-) -> Result<(), SendPktsError> {
-    let pkts: Vec<_> = dests.iter().map(|addr| (packet, *addr)).collect();
-    batch_send(sock, &pkts[..])
+    packet: T,
+    dests: &[S],
+) -> Result<(), SendPktsError>
+where
+    S: Borrow<SocketAddr>,
+    T: AsRef<[u8]>,
+{
+    let dests = dests.iter().map(Borrow::borrow);
+    let pkts: Vec<_> = repeat(&packet).zip(dests).collect();
+    batch_send(sock, &pkts)
 }
 
 #[cfg(test)]

@@ -2,22 +2,31 @@
 
 #![cfg(feature = "full")]
 
-use crate::sanitize::{Sanitize, SanitizeError};
-use crate::secp256k1_instruction::verify_eth_addresses;
-use crate::{
-    hash::Hash,
-    instruction::{CompiledInstruction, Instruction, InstructionError},
-    message::Message,
-    program_utils::limited_deserialize,
-    pubkey::Pubkey,
-    short_vec,
-    signature::{Signature, SignerError},
-    signers::Signers,
-    system_instruction::SystemInstruction,
-    system_program,
+use {
+    crate::{
+        hash::Hash,
+        instruction::{CompiledInstruction, Instruction, InstructionError},
+        message::{Message, SanitizeMessageError},
+        nonce::NONCED_TX_MARKER_IX_INDEX,
+        program_utils::limited_deserialize,
+        pubkey::Pubkey,
+        sanitize::{Sanitize, SanitizeError},
+        secp256k1_instruction::verify_eth_addresses,
+        short_vec,
+        signature::{Signature, SignerError},
+        signers::Signers,
+    },
+    serde::Serialize,
+    solana_program::{system_instruction::SystemInstruction, system_program},
+    std::result,
+    thiserror::Error,
 };
-use std::result;
-use thiserror::Error;
+
+mod sanitized;
+mod versioned;
+
+pub use sanitized::*;
+pub use versioned::*;
 
 /// Reasons a transaction might be rejected.
 #[derive(
@@ -98,6 +107,15 @@ pub enum TransactionError {
     /// Transaction processing left an account with an outstanding borrowed reference
     #[error("Transaction processing left an account with an outstanding borrowed reference")]
     AccountBorrowOutstanding,
+
+    #[error(
+        "Transaction could not fit into current block without exceeding the Max Block Cost Limit"
+    )]
+    WouldExceedMaxBlockCostLimit,
+
+    /// Transaction version is unsupported
+    #[error("Transaction version is unsupported")]
+    UnsupportedVersion,
 }
 
 pub type Result<T> = result::Result<T, TransactionError>;
@@ -108,13 +126,27 @@ impl From<SanitizeError> for TransactionError {
     }
 }
 
+impl From<SanitizeMessageError> for TransactionError {
+    fn from(err: SanitizeMessageError) -> Self {
+        match err {
+            SanitizeMessageError::IndexOutOfBounds
+            | SanitizeMessageError::ValueOutOfBounds
+            | SanitizeMessageError::InvalidValue => Self::SanitizeFailure,
+            SanitizeMessageError::DuplicateAccountKey => Self::AccountLoadedTwice,
+        }
+    }
+}
+
 /// An atomic transaction
-#[frozen_abi(digest = "AAeVxvWiiotwxDLxKLxsfgkA6ndW74nVbaAEb6cwJYqR")]
+#[frozen_abi(digest = "FZtncnS1Xk8ghHfKiXE5oGiUbw2wJhmfXQuNgQR3K6Mc")]
 #[derive(Debug, PartialEq, Default, Eq, Clone, Serialize, Deserialize, AbiExample)]
 pub struct Transaction {
-    /// A set of digital signatures of `account_keys`, `program_ids`, `recent_blockhash`, and `instructions`, signed by the first
-    /// signatures.len() keys of account_keys
-    /// NOTE: Serialization-related changes must be paired with the direct read at sigverify.
+    /// A set of digital signatures of a serialized [`Message`], signed by the
+    /// first `signatures.len()` keys of [`account_keys`].
+    ///
+    /// [`account_keys`]: Message::account_keys
+    ///
+    // NOTE: Serialization-related changes must be paired with the direct read at sigverify.
     #[serde(with = "short_vec")]
     pub signatures: Vec<Signature>,
 
@@ -221,10 +253,12 @@ impl Transaction {
             .and_then(|instruction| instruction.accounts.get(accounts_index))
             .map(|&account_keys_index| account_keys_index as usize)
     }
+
     pub fn key(&self, instruction_index: usize, accounts_index: usize) -> Option<&Pubkey> {
         self.key_index(instruction_index, accounts_index)
             .and_then(|account_keys_index| self.message.account_keys.get(account_keys_index))
     }
+
     pub fn signer_key(&self, instruction_index: usize, accounts_index: usize) -> Option<&Pubkey> {
         match self.key_index(instruction_index, accounts_index) {
             None => None,
@@ -464,7 +498,7 @@ pub fn uses_durable_nonce(tx: &Transaction) -> Option<&CompiledInstruction> {
     let message = tx.message();
     message
         .instructions
-        .get(0)
+        .get(NONCED_TX_MARKER_IX_INDEX as usize)
         .filter(|maybe_ix| {
             let prog_id_idx = maybe_ix.program_id_index as usize;
             match message.account_keys.get(prog_id_idx) {
@@ -475,6 +509,7 @@ pub fn uses_durable_nonce(tx: &Transaction) -> Option<&CompiledInstruction> {
         )
 }
 
+#[deprecated]
 pub fn get_nonce_pubkey_from_instruction<'a>(
     ix: &CompiledInstruction,
     tx: &'a Transaction,
@@ -487,6 +522,8 @@ pub fn get_nonce_pubkey_from_instruction<'a>(
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
+
     use super::*;
     use crate::{
         hash::hash,
@@ -544,6 +581,7 @@ mod tests {
         assert_eq!(*get_program_id(&tx, 0), prog1);
         assert_eq!(*get_program_id(&tx, 1), prog2);
     }
+
     #[test]
     fn test_refs_invalid_program_id() {
         let key = Keypair::new();

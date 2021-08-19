@@ -2,7 +2,7 @@
 use log::*;
 use solana_metrics::{datapoint_warn, inc_new_counter_info};
 use solana_runtime::{bank::Bank, bank_forks::BankForks};
-use solana_sdk::{clock::Slot, signature::Signature};
+use solana_sdk::signature::Signature;
 use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket},
@@ -24,15 +24,19 @@ pub struct SendTransactionService {
 pub struct TransactionInfo {
     pub signature: Signature,
     pub wire_transaction: Vec<u8>,
-    pub last_valid_slot: Slot,
+    pub last_valid_block_height: u64,
 }
 
 impl TransactionInfo {
-    pub fn new(signature: Signature, wire_transaction: Vec<u8>, last_valid_slot: Slot) -> Self {
+    pub fn new(
+        signature: Signature,
+        wire_transaction: Vec<u8>,
+        last_valid_block_height: u64,
+    ) -> Self {
         Self {
             signature,
             wire_transaction,
-            last_valid_slot,
+            last_valid_block_height,
         }
     }
 }
@@ -124,7 +128,7 @@ impl SendTransactionService {
                 result.rooted += 1;
                 inc_new_counter_info!("send_transaction_service-rooted", 1);
                 false
-            } else if transaction_info.last_valid_slot < root_bank.slot() {
+            } else if transaction_info.last_valid_block_height < root_bank.block_height() {
                 info!("Dropping expired transaction: {}", signature);
                 result.expired += 1;
                 inc_new_counter_info!("send_transaction_service-expired", 1);
@@ -189,7 +193,7 @@ mod test {
     #[test]
     fn service_exit() {
         let tpu_address = "127.0.0.1:0".parse().unwrap();
-        let bank = Bank::default();
+        let bank = Bank::default_for_tests();
         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
         let (sender, receiver) = channel();
 
@@ -203,7 +207,7 @@ mod test {
     #[test]
     fn process_transactions() {
         let (genesis_config, mint_keypair) = create_genesis_config(4);
-        let bank = Bank::new(&genesis_config);
+        let bank = Bank::new_for_tests(&genesis_config);
         let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
         let send_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
         let tpu_address = "127.0.0.1:0".parse().unwrap();

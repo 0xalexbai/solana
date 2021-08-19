@@ -53,7 +53,7 @@ fn test_rpc_client() {
 
     let original_alice_balance = client.get_balance(&alice.pubkey()).unwrap();
 
-    let (blockhash, _fee_calculator) = client.get_recent_blockhash().unwrap();
+    let blockhash = client.get_latest_blockhash().unwrap();
 
     let tx = system_transaction::transfer(&alice, &bob_pubkey, sol_to_lamports(20.0), blockhash);
     let signature = client.send_transaction(&tx).unwrap();
@@ -94,7 +94,7 @@ fn test_slot_subscription() {
     );
     let exit = Arc::new(AtomicBool::new(false));
     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
-    let bank = Bank::new(&genesis_config);
+    let bank = Bank::new_for_tests(&genesis_config);
     let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
     let optimistically_confirmed_bank =
         OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);

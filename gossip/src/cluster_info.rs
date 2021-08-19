@@ -252,7 +252,7 @@ pub fn make_accounts_hashes_message(
 pub(crate) type Ping = ping_pong::Ping<[u8; GOSSIP_PING_TOKEN_SIZE]>;
 
 // TODO These messages should go through the gpu pipeline for spam filtering
-#[frozen_abi(digest = "4khbdefBamDC8XpdahkW4bzkGX6N5c8PcHp3kBXJGg46")]
+#[frozen_abi(digest = "AqKhoLDkFr85WPiZnXG4bcRwHU4qSSyDZ3MQZLk3cnJf")]
 #[derive(Serialize, Deserialize, Debug, AbiEnumVisitor, AbiExample)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Protocol {
@@ -1241,7 +1241,7 @@ impl ClusterInfo {
     /// We need to avoid having obj locked while doing a io, such as the `send_to`
     pub fn retransmit_to(
         peers: &[&ContactInfo],
-        packet: &Packet,
+        data: &[u8],
         s: &UdpSocket,
         forwarded: bool,
         socket_addr_space: &SocketAddrSpace,
@@ -1250,18 +1250,16 @@ impl ClusterInfo {
         let dests: Vec<_> = if forwarded {
             peers
                 .iter()
-                .map(|peer| &peer.tvu_forwards)
+                .map(|peer| peer.tvu_forwards)
                 .filter(|addr| ContactInfo::is_valid_address(addr, socket_addr_space))
                 .collect()
         } else {
             peers
                 .iter()
-                .map(|peer| &peer.tvu)
+                .map(|peer| peer.tvu)
                 .filter(|addr| socket_addr_space.check(addr))
                 .collect()
         };
-        let data = &packet.data[..packet.meta.size];
-
         if let Err(SendPktsError::IoError(ioerr, num_failed)) = multi_target_send(s, data, &dests) {
             inc_new_counter_info!("cluster_info-retransmit-packets", dests.len(), 1);
             inc_new_counter_error!("cluster_info-retransmit-error", num_failed, 1);
@@ -1635,9 +1633,8 @@ impl ClusterInfo {
         bank_forks: Option<Arc<RwLock<BankForks>>>,
         sender: PacketSender,
         gossip_validators: Option<HashSet<Pubkey>>,
-        exit: &Arc<AtomicBool>,
+        exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        let exit = exit.clone();
         let thread_pool = ThreadPoolBuilder::new()
             .num_threads(std::cmp::min(get_thread_count(), 8))
             .thread_name(|i| format!("ClusterInfo::gossip-{}", i))
@@ -1691,7 +1688,7 @@ impl ClusterInfo {
                                 Some(root_bank.feature_set.clone()),
                             )
                         }
-                        None => (HashMap::new(), None),
+                        None => (Arc::default(), None),
                     };
                     let require_stake_for_gossip =
                         self.require_stake_for_gossip(feature_set.as_deref(), &stakes);
@@ -1812,8 +1809,13 @@ impl ClusterInfo {
             self.stats
                 .pull_requests_count
                 .add_relaxed(requests.len() as u64);
-            let response =
-                self.handle_pull_requests(recycler, requests, stakes, require_stake_for_gossip);
+            let response = self.handle_pull_requests(
+                thread_pool,
+                recycler,
+                requests,
+                stakes,
+                require_stake_for_gossip,
+            );
             if !response.is_empty() {
                 self.stats
                     .packets_sent_pull_responses_count
@@ -1883,6 +1885,7 @@ impl ClusterInfo {
     // and tries to send back to them the values it detects are missing.
     fn handle_pull_requests(
         &self,
+        thread_pool: &ThreadPool,
         recycler: &PacketsRecycler,
         requests: Vec<PullData>,
         stakes: &HashMap<Pubkey, u64>,
@@ -1914,8 +1917,12 @@ impl ClusterInfo {
         let self_id = self.id();
         let mut pull_responses = {
             let _st = ScopedTimer::from(&self.stats.generate_pull_responses);
-            self.gossip
-                .generate_pull_responses(&caller_and_filters, output_size_limit, now)
+            self.gossip.generate_pull_responses(
+                thread_pool,
+                &caller_and_filters,
+                output_size_limit,
+                now,
+            )
         };
         if require_stake_for_gossip {
             for resp in &mut pull_responses {
@@ -2476,7 +2483,7 @@ impl ClusterInfo {
         // feature does not roll back (if the feature happens to get enabled in
         // a minority fork).
         let (feature_set, stakes) = match bank_forks {
-            None => (None, HashMap::default()),
+            None => (None, Arc::default()),
             Some(bank_forks) => {
                 let bank = bank_forks.read().unwrap().root_bank();
                 let feature_set = bank.feature_set.clone();
@@ -2516,6 +2523,9 @@ impl ClusterInfo {
                 match self.run_socket_consume(&receiver, &sender, &thread_pool) {
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Disconnected)) => break,
                     Err(GossipError::RecvTimeoutError(RecvTimeoutError::Timeout)) => (),
+                    // A send operation can only fail if the receiving end of a
+                    // channel is disconnected.
+                    Err(GossipError::SendError) => break,
                     Err(err) => error!("gossip consume: {}", err),
                     Ok(()) => (),
                 }
@@ -2531,19 +2541,18 @@ impl ClusterInfo {
         requests_receiver: Receiver<Vec<(/*from:*/ SocketAddr, Protocol)>>,
         response_sender: PacketSender,
         should_check_duplicate_instance: bool,
-        exit: &Arc<AtomicBool>,
+        exit: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
-        let exit = exit.clone();
+        let mut last_print = Instant::now();
         let recycler = PacketsRecycler::default();
+        let thread_pool = ThreadPoolBuilder::new()
+            .num_threads(get_thread_count().min(8))
+            .thread_name(|i| format!("sol-gossip-work-{}", i))
+            .build()
+            .unwrap();
         Builder::new()
             .name("solana-listen".to_string())
             .spawn(move || {
-                let thread_pool = ThreadPoolBuilder::new()
-                    .num_threads(std::cmp::min(get_thread_count(), 8))
-                    .thread_name(|i| format!("sol-gossip-work-{}", i))
-                    .build()
-                    .unwrap();
-                let mut last_print = Instant::now();
                 while !exit.load(Ordering::Relaxed) {
                     if let Err(err) = self.run_listen(
                         &recycler,
@@ -2911,18 +2920,24 @@ fn filter_on_shred_version(
 ) -> Option<Protocol> {
     let filter_values = |from: &Pubkey, values: &mut Vec<CrdsValue>, skipped_counter: &Counter| {
         let num_values = values.len();
+        // Node-instances are always exempted from shred-version check so that:
+        // * their propagation across cluster is expedited.
+        // * prevent two running instances of the same identity key cross
+        //   contaminate gossip between clusters.
         if crds.get_shred_version(from) == Some(self_shred_version) {
-            // Retain values with the same shred-vesion, or those which are
-            // contact-info so that shred-versions can be updated.
             values.retain(|value| match &value.data {
+                // Allow contact-infos so that shred-versions are updated.
                 CrdsData::ContactInfo(_) => true,
+                CrdsData::NodeInstance(_) => true,
+                // Only retain values with the same shred version.
                 _ => crds.get_shred_version(&value.pubkey()) == Some(self_shred_version),
             })
         } else {
-            // Only allow node to update its own contact info in case their
-            // shred-version changes.
             values.retain(|value| match &value.data {
+                // Allow node to update its own contact info in case their
+                // shred-version changes
                 CrdsData::ContactInfo(node) => node.id == *from,
+                CrdsData::NodeInstance(_) => true,
                 _ => false,
             })
         }

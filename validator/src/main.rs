@@ -10,8 +10,8 @@ use {
     solana_clap_utils::{
         input_parsers::{keypair_of, keypairs_of, pubkey_of, value_of},
         input_validators::{
-            is_keypair, is_keypair_or_ask_keyword, is_parsable, is_pubkey, is_pubkey_or_keypair,
-            is_slot,
+            is_bin, is_keypair, is_keypair_or_ask_keyword, is_parsable, is_pubkey,
+            is_pubkey_or_keypair, is_slot,
         },
         keypair::SKIP_SEED_PHRASE_VALIDATION_ARG,
     },
@@ -21,6 +21,7 @@ use {
     },
     solana_core::{
         ledger_cleanup_service::{DEFAULT_MAX_LEDGER_SHREDS, DEFAULT_MIN_MAX_LEDGER_SHREDS},
+        tower_storage,
         tpu::DEFAULT_TPU_COALESCE_MS,
         validator::{
             is_snapshot_config_invalid, Validator, ValidatorConfig, ValidatorStartProgress,
@@ -44,8 +45,10 @@ use {
         },
         accounts_index::{
             AccountIndex, AccountSecondaryIndexes, AccountSecondaryIndexesIncludeExclude,
+            AccountsIndexConfig,
         },
         hardened_unpack::MAX_GENESIS_ARCHIVE_UNPACKED_SIZE,
+        snapshot_archive_info::SnapshotArchiveInfoGetter,
         snapshot_config::SnapshotConfig,
         snapshot_utils::{
             self, ArchiveFormat, SnapshotVersion, DEFAULT_MAX_FULL_SNAPSHOT_ARCHIVES_TO_RETAIN,
@@ -481,7 +484,7 @@ fn get_rpc_node(
         let mut highest_snapshot_hash: Option<(Slot, Hash)> =
             snapshot_utils::get_highest_full_snapshot_archive_info(snapshot_output_dir).map(
                 |snapshot_archive_info| {
-                    (*snapshot_archive_info.slot(), *snapshot_archive_info.hash())
+                    (snapshot_archive_info.slot(), *snapshot_archive_info.hash())
                 },
             );
         let eligible_rpc_peers = if snapshot_not_required {
@@ -1297,7 +1300,58 @@ pub fn main() {
                 .long("tower")
                 .value_name("DIR")
                 .takes_value(true)
-                .help("Use DIR as tower location [default: --ledger value]"),
+                .help("Use DIR as file tower storage location [default: --ledger value]"),
+        )
+        .arg(
+            Arg::with_name("tower_storage")
+                .long("tower-storage")
+                .possible_values(&["file", "etcd"])
+                .default_value("file")
+                .takes_value(true)
+                .help("Where to store the tower"),
+        )
+        .arg(
+            Arg::with_name("etcd_endpoint")
+                .long("etcd-endpoint")
+                .required_if("tower_storage", "etcd")
+                .value_name("HOST:PORT")
+                .takes_value(true)
+                .multiple(true)
+                .validator(solana_net_utils::is_host_port)
+                .help("etcd gRPC endpoint to connect with")
+        )
+        .arg(
+            Arg::with_name("etcd_domain_name")
+                .long("etcd-domain-name")
+                .required_if("tower_storage", "etcd")
+                .value_name("DOMAIN")
+                .default_value("localhost")
+                .takes_value(true)
+                .help("domain name against which to verify the etcd server’s TLS certificate")
+        )
+        .arg(
+            Arg::with_name("etcd_cacert_file")
+                .long("etcd-cacert-file")
+                .required_if("tower_storage", "etcd")
+                .value_name("FILE")
+                .takes_value(true)
+                .help("verify the TLS certificate of the etcd endpoint using this CA bundle")
+        )
+        .arg(
+            Arg::with_name("etcd_key_file")
+                .long("etcd-key-file")
+                .required_if("tower_storage", "etcd")
+                .value_name("FILE")
+                .takes_value(true)
+                .help("TLS key file to use when establishing a connection to the etcd endpoint")
+        )
+        .arg(
+            Arg::with_name("etcd_cert_file")
+                .long("etcd-cert-file")
+                .required_if("tower_storage", "etcd")
+                .value_name("FILE")
+                .takes_value(true)
+                .help("TLS certificate to use when establishing a connection to the etcd endpoint")
         )
         .arg(
             Arg::with_name("gossip_port")
@@ -1314,7 +1368,6 @@ pub fn main() {
                 .validator(solana_net_utils::is_host)
                 .help("Gossip DNS name or IP address for the validator to advertise in gossip \
                        [default: ask --entrypoint, or 127.0.0.1 when --entrypoint is not provided]"),
-
         )
         .arg(
             Arg::with_name("public_rpc_addr")
@@ -1813,6 +1866,20 @@ pub fn main() {
                 .help("Disables accounts caching"),
         )
         .arg(
+            Arg::with_name("accounts_db_skip_shrink")
+                .long("accounts-db-skip-shrink")
+                .help("Enables faster starting of validators by skipping shrink. \
+                      This option is for use during testing."),
+        )
+        .arg(
+            Arg::with_name("accounts_index_bins")
+                .long("accounts-index-bins")
+                .value_name("BINS")
+                .validator(is_bin)
+                .takes_value(true)
+                .help("Number of bins to divide the accounts index into"),
+        )
+        .arg(
             Arg::with_name("accounts_db_test_hash_calculation")
                 .long("accounts-db-test-hash-calculation")
                 .help("Enables testing of hash calculation using stores in \
@@ -2132,6 +2199,33 @@ pub fn main() {
         .exit();
     });
 
+    let logfile = {
+        let logfile = matches
+            .value_of("logfile")
+            .map(|s| s.into())
+            .unwrap_or_else(|| format!("solana-validator-{}.log", identity_keypair.pubkey()));
+
+        if logfile == "-" {
+            None
+        } else {
+            println!("log file: {}", logfile);
+            Some(logfile)
+        }
+    };
+    let use_progress_bar = logfile.is_none();
+    let _logger_thread = redirect_stderr_to_file(logfile);
+
+    info!("{} {}", crate_name!(), solana_version::version!());
+    info!("Starting validator with: {:#?}", std::env::args_os());
+
+    let cuda = matches.is_present("cuda");
+    if cuda {
+        solana_perf::perf_libs::init_cuda();
+        enable_recycler_warming();
+    }
+
+    solana_core::validator::report_target_features();
+
     let authorized_voter_keypairs = keypairs_of(&matches, "authorized_voter_keypairs")
         .map(|keypairs| keypairs.into_iter().map(Arc::new).collect())
         .unwrap_or_else(|| {
@@ -2253,13 +2347,55 @@ pub fn main() {
         .ok()
         .or_else(|| get_cluster_shred_version(&entrypoint_addrs));
 
+    let tower_storage: Arc<dyn solana_core::tower_storage::TowerStorage> =
+        match value_t_or_exit!(matches, "tower_storage", String).as_str() {
+            "file" => {
+                let tower_path = value_t!(matches, "tower", PathBuf)
+                    .ok()
+                    .unwrap_or_else(|| ledger_path.clone());
+
+                Arc::new(tower_storage::FileTowerStorage::new(tower_path))
+            }
+            "etcd" => {
+                let endpoints = values_t_or_exit!(matches, "etcd_endpoint", String);
+                let domain_name = value_t_or_exit!(matches, "etcd_domain_name", String);
+                let ca_certificate_file = value_t_or_exit!(matches, "etcd_cacert_file", String);
+                let identity_certificate_file = value_t_or_exit!(matches, "etcd_cert_file", String);
+                let identity_private_key_file = value_t_or_exit!(matches, "etcd_key_file", String);
+
+                let read = |file| {
+                    fs::read(&file).unwrap_or_else(|err| {
+                        eprintln!("Unable to read {}: {}", file, err);
+                        exit(1)
+                    })
+                };
+
+                let tls_config = tower_storage::EtcdTlsConfig {
+                    domain_name,
+                    ca_certificate: read(ca_certificate_file),
+                    identity_certificate: read(identity_certificate_file),
+                    identity_private_key: read(identity_private_key_file),
+                };
+
+                Arc::new(
+                    tower_storage::EtcdTowerStorage::new(endpoints, Some(tls_config))
+                        .unwrap_or_else(|err| {
+                            eprintln!("Failed to connect to etcd: {}", err);
+                            exit(1);
+                        }),
+                )
+            }
+            _ => unreachable!(),
+        };
+
+    let accounts_index_config = value_t!(matches, "accounts_index_bins", usize)
+        .ok()
+        .map(|bins| AccountsIndexConfig { bins: Some(bins) });
+
     let mut validator_config = ValidatorConfig {
         require_tower: matches.is_present("require_tower"),
-        tower_path: value_t!(matches, "tower", PathBuf)
-            .ok()
-            .or_else(|| Some(ledger_path.clone())),
+        tower_storage,
         dev_halt_at_slot: value_t!(matches, "dev_halt_at_slot", Slot).ok(),
-        cuda: matches.is_present("cuda"),
         expected_genesis_hash: matches
             .value_of("expected_genesis_hash")
             .map(|s| Hash::from_str(s).unwrap()),
@@ -2353,6 +2489,8 @@ pub fn main() {
         account_indexes,
         accounts_db_caching_enabled: !matches.is_present("no_accounts_db_caching"),
         accounts_db_test_hash_calculation: matches.is_present("accounts_db_test_hash_calculation"),
+        accounts_index_config,
+        accounts_db_skip_shrink: matches.is_present("accounts_db_skip_shrink"),
         accounts_db_use_index_hash_calculation: matches.is_present("accounts_db_index_hashing"),
         tpu_coalesce_ms,
         no_wait_for_vote_to_start_leader: matches.is_present("no_wait_for_vote_to_start_leader"),
@@ -2468,11 +2606,12 @@ pub fn main() {
                 })
             });
     validator_config.snapshot_config = Some(SnapshotConfig {
-        snapshot_interval_slots: if snapshot_interval_slots > 0 {
+        full_snapshot_archive_interval_slots: if snapshot_interval_slots > 0 {
             snapshot_interval_slots
         } else {
             std::u64::MAX
         },
+        incremental_snapshot_archive_interval_slots: Slot::MAX,
         snapshot_path,
         snapshot_package_output_path: snapshot_output_dir.clone(),
         archive_format,
@@ -2532,25 +2671,6 @@ pub fn main() {
         exit(1);
     });
 
-    let logfile = {
-        let logfile = matches
-            .value_of("logfile")
-            .map(|s| s.into())
-            .unwrap_or_else(|| format!("solana-validator-{}.log", identity_keypair.pubkey()));
-
-        if logfile == "-" {
-            None
-        } else {
-            println!("log file: {}", logfile);
-            Some(logfile)
-        }
-    };
-    let use_progress_bar = logfile.is_none();
-    let _logger_thread = redirect_stderr_to_file(logfile);
-
-    info!("{} {}", crate_name!(), solana_version::version!());
-    info!("Starting validator with: {:#?}", std::env::args_os());
-
     let start_progress = Arc::new(RwLock::new(ValidatorStartProgress::default()));
     let admin_service_cluster_info = Arc::new(RwLock::new(None));
     admin_rpc_service::run(
@@ -2562,7 +2682,7 @@ pub fn main() {
             start_progress: start_progress.clone(),
             authorized_voter_keypairs: authorized_voter_keypairs.clone(),
             cluster_info: admin_service_cluster_info.clone(),
-            tower_path: validator_config.tower_path.clone().unwrap(),
+            tower_storage: validator_config.tower_storage.clone(),
         },
     );
 
@@ -2658,10 +2778,6 @@ pub fn main() {
     solana_metrics::set_host_id(identity_keypair.pubkey().to_string());
     solana_metrics::set_panic_hook("validator");
 
-    if validator_config.cuda {
-        solana_perf::perf_libs::init_cuda();
-        enable_recycler_warming();
-    }
     solana_entry::entry::init_poh();
     solana_runtime::snapshot_utils::remove_tmp_snapshot_archives(&snapshot_output_dir);
 

@@ -1,39 +1,38 @@
-use crate::{
-    heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
-    latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
-    progress_map::{LockoutIntervals, ProgressMap},
-};
-use chrono::prelude::*;
-use solana_ledger::{ancestor_iterator::AncestorIterator, blockstore::Blockstore, blockstore_db};
-use solana_measure::measure::Measure;
-use solana_runtime::{
-    bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE,
-    vote_account::ArcVoteAccount,
-};
-use solana_sdk::{
-    clock::{Slot, UnixTimestamp},
-    hash::Hash,
-    instruction::Instruction,
-    pubkey::Pubkey,
-    signature::{Keypair, Signature, Signer},
-    slot_history::{Check, SlotHistory},
-};
-use solana_vote_program::{
-    vote_instruction,
-    vote_state::{BlockTimestamp, Lockout, Vote, VoteState, MAX_LOCKOUT_HISTORY},
-};
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    fs::{self, File},
-    io::BufReader,
-    ops::{
-        Bound::{Included, Unbounded},
-        Deref,
+use {
+    crate::{
+        heaviest_subtree_fork_choice::HeaviestSubtreeForkChoice,
+        latest_validator_votes_for_frozen_banks::LatestValidatorVotesForFrozenBanks,
+        progress_map::{LockoutIntervals, ProgressMap},
+        tower_storage::{SavedTower, TowerStorage},
     },
-    path::{Path, PathBuf},
+    chrono::prelude::*,
+    solana_ledger::{ancestor_iterator::AncestorIterator, blockstore::Blockstore, blockstore_db},
+    solana_runtime::{
+        bank::Bank, bank_forks::BankForks, commitment::VOTE_THRESHOLD_SIZE,
+        vote_account::VoteAccount,
+    },
+    solana_sdk::{
+        clock::{Slot, UnixTimestamp},
+        hash::Hash,
+        instruction::Instruction,
+        pubkey::Pubkey,
+        signature::Keypair,
+        slot_history::{Check, SlotHistory},
+    },
+    solana_vote_program::{
+        vote_instruction,
+        vote_state::{BlockTimestamp, Lockout, Vote, VoteState, MAX_LOCKOUT_HISTORY},
+    },
+    std::{
+        cmp::Ordering,
+        collections::{HashMap, HashSet},
+        ops::{
+            Bound::{Included, Unbounded},
+            Deref,
+        },
+    },
+    thiserror::Error,
 };
-use thiserror::Error;
 
 #[derive(PartialEq, Clone, Debug, AbiExample)]
 pub enum SwitchForkDecision {
@@ -106,7 +105,7 @@ pub(crate) struct ComputedBankState {
 #[frozen_abi(digest = "GMs1FxKteU7K4ZFRofMBqNhBpM4xkPVxfYod6R8DQmpT")]
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
 pub struct Tower {
-    node_pubkey: Pubkey,
+    pub(crate) node_pubkey: Pubkey,
     threshold_depth: usize,
     threshold_size: f64,
     vote_state: VoteState,
@@ -118,12 +117,6 @@ pub struct Tower {
     //  block 10, in  which case `last_vote_tx_blockhash` equals the blockhash of 10, not 5.
     last_vote_tx_blockhash: Hash,
     last_timestamp: BlockTimestamp,
-    #[serde(skip)]
-    pub(crate) ledger_path: PathBuf,
-    #[serde(skip)]
-    path: PathBuf,
-    #[serde(skip)]
-    tmp_path: PathBuf, // used before atomic fs::rename()
     #[serde(skip)]
     // Restored last voted slot which cannot be found in SlotHistory at replayed root
     // (This is a special field for slashing-free validator restart with edge cases).
@@ -146,9 +139,6 @@ impl Default for Tower {
             last_vote: Vote::default(),
             last_timestamp: BlockTimestamp::default(),
             last_vote_tx_blockhash: Hash::default(),
-            ledger_path: PathBuf::default(),
-            path: PathBuf::default(),
-            tmp_path: PathBuf::default(),
             stray_restored_slot: Option::default(),
             last_switch_threshold_check: Option::default(),
         };
@@ -164,23 +154,13 @@ impl Tower {
         vote_account_pubkey: &Pubkey,
         root: Slot,
         bank: &Bank,
-        ledger_path: &Path,
     ) -> Self {
         let mut tower = Tower {
-            ledger_path: ledger_path.into(),
+            node_pubkey: *node_pubkey,
             ..Tower::default()
         };
-        tower.set_identity(*node_pubkey);
         tower.initialize_lockouts_from_bank(vote_account_pubkey, root, bank);
         tower
-    }
-
-    fn set_identity(&mut self, node_pubkey: Pubkey) {
-        let path = Self::get_filename(&self.ledger_path, &node_pubkey);
-        let tmp_path = Self::get_tmp_filename(&path);
-        self.node_pubkey = node_pubkey;
-        self.path = path;
-        self.tmp_path = tmp_path;
     }
 
     #[cfg(test)]
@@ -194,7 +174,6 @@ impl Tower {
 
     pub fn new_from_bankforks(
         bank_forks: &BankForks,
-        ledger_path: &Path,
         node_pubkey: &Pubkey,
         vote_account: &Pubkey,
     ) -> Self {
@@ -216,7 +195,7 @@ impl Tower {
             )
             .clone();
 
-        Self::new(node_pubkey, vote_account, root, &heaviest_bank, ledger_path)
+        Self::new(node_pubkey, vote_account, root, &heaviest_bank)
     }
 
     pub(crate) fn collect_vote_lockouts<F>(
@@ -228,7 +207,7 @@ impl Tower {
         latest_validator_votes_for_frozen_banks: &mut LatestValidatorVotesForFrozenBanks,
     ) -> ComputedBankState
     where
-        F: IntoIterator<Item = (Pubkey, (u64, ArcVoteAccount))>,
+        F: IntoIterator<Item = (Pubkey, (u64, VoteAccount))>,
     {
         let mut vote_slots = HashSet::new();
         let mut voted_stakes = HashMap::new();
@@ -574,7 +553,7 @@ impl Tower {
         descendants: &HashMap<Slot, HashSet<u64>>,
         progress: &ProgressMap,
         total_stake: u64,
-        epoch_vote_accounts: &HashMap<Pubkey, (u64, ArcVoteAccount)>,
+        epoch_vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
         latest_validator_votes_for_frozen_banks: &LatestValidatorVotesForFrozenBanks,
         heaviest_subtree_fork_choice: &HeaviestSubtreeForkChoice,
     ) -> SwitchForkDecision {
@@ -844,7 +823,7 @@ impl Tower {
         descendants: &HashMap<Slot, HashSet<u64>>,
         progress: &ProgressMap,
         total_stake: u64,
-        epoch_vote_accounts: &HashMap<Pubkey, (u64, ArcVoteAccount)>,
+        epoch_vote_accounts: &HashMap<Pubkey, (u64, VoteAccount)>,
         latest_validator_votes_for_frozen_banks: &LatestValidatorVotesForFrozenBanks,
         heaviest_subtree_fork_choice: &HeaviestSubtreeForkChoice,
     ) -> SwitchForkDecision {
@@ -1195,71 +1174,15 @@ impl Tower {
         self.vote_state.root_slot = Some(root);
     }
 
-    pub fn get_filename(path: &Path, node_pubkey: &Pubkey) -> PathBuf {
-        path.join(format!("tower-{}", node_pubkey))
-            .with_extension("bin")
-    }
-
-    fn get_tmp_filename(path: &Path) -> PathBuf {
-        path.with_extension("bin.new")
-    }
-
-    pub fn save(&self, node_keypair: &Keypair) -> Result<()> {
-        let mut measure = Measure::start("tower_save-ms");
-
-        if self.node_pubkey != node_keypair.pubkey() {
-            return Err(TowerError::WrongTower(format!(
-                "node_pubkey is {:?} but found tower for {:?}",
-                node_keypair.pubkey(),
-                self.node_pubkey
-            )));
-        }
-
-        let filename = &self.path;
-        let new_filename = &self.tmp_path;
-        {
-            // overwrite anything if exists
-            let mut file = File::create(&new_filename)?;
-            let saved_tower = SavedTower::new(self, node_keypair)?;
-            bincode::serialize_into(&mut file, &saved_tower)?;
-            // file.sync_all() hurts performance; pipeline sync-ing and submitting votes to the cluster!
-        }
-        trace!("persisted votes: {:?}", self.voted_slots());
-        fs::rename(&new_filename, &filename)?;
-        // self.path.parent().sync_all() hurts performance same as the above sync
-
-        measure.stop();
-        inc_new_counter_info!("tower_save-ms", measure.as_ms() as usize);
-
+    pub fn save(&self, tower_storage: &dyn TowerStorage, node_keypair: &Keypair) -> Result<()> {
+        let saved_tower = SavedTower::new(self, node_keypair)?;
+        tower_storage.store(&saved_tower)?;
         Ok(())
     }
 
-    pub fn restore(ledger_path: &Path, node_pubkey: &Pubkey) -> Result<Self> {
-        let filename = Self::get_filename(ledger_path, node_pubkey);
-
-        // Ensure to create parent dir here, because restore() precedes save() always
-        fs::create_dir_all(&filename.parent().unwrap())?;
-
-        let file = File::open(&filename)?;
-        let mut stream = BufReader::new(file);
-
-        let saved_tower: SavedTower = bincode::deserialize_from(&mut stream)?;
-        if !saved_tower.verify(node_pubkey) {
-            return Err(TowerError::InvalidSignature);
-        }
-        let mut tower = saved_tower.deserialize()?;
-        tower.ledger_path = ledger_path.into();
-        tower.path = filename;
-        tower.tmp_path = Self::get_tmp_filename(&tower.path);
-
-        // check that the tower actually belongs to this node
-        if &tower.node_pubkey != node_pubkey {
-            return Err(TowerError::WrongTower(format!(
-                "node_pubkey is {:?} but found tower for {:?}",
-                node_pubkey, tower.node_pubkey
-            )));
-        }
-        Ok(tower)
+    pub fn restore(tower_storage: &dyn TowerStorage, node_pubkey: &Pubkey) -> Result<Self> {
+        let saved_tower = tower_storage.load(node_pubkey)?;
+        saved_tower.try_into_tower(node_pubkey)
     }
 }
 
@@ -1297,29 +1220,6 @@ impl TowerError {
         } else {
             false
         }
-    }
-}
-
-#[frozen_abi(digest = "Gaxfwvx5MArn52mKZQgzHmDCyn5YfCuTHvp5Et3rFfpp")]
-#[derive(Default, Clone, Serialize, Deserialize, Debug, PartialEq, AbiExample)]
-pub struct SavedTower {
-    signature: Signature,
-    data: Vec<u8>,
-}
-
-impl SavedTower {
-    pub fn new<T: Signer>(tower: &Tower, keypair: &T) -> Result<Self> {
-        let data = bincode::serialize(tower)?;
-        let signature = keypair.sign_message(&data);
-        Ok(Self { signature, data })
-    }
-
-    pub fn verify(&self, pubkey: &Pubkey) -> bool {
-        self.signature.verify(pubkey.as_ref(), &self.data)
-    }
-
-    pub fn deserialize(&self) -> Result<Tower> {
-        bincode::deserialize(&self.data).map_err(|e| e.into())
     }
 }
 
@@ -1373,7 +1273,8 @@ pub mod test {
     use super::*;
     use crate::{
         fork_choice::ForkChoice, heaviest_subtree_fork_choice::SlotHashKey,
-        replay_stage::HeaviestForkFailures, vote_simulator::VoteSimulator,
+        replay_stage::HeaviestForkFailures, tower_storage::FileTowerStorage,
+        vote_simulator::VoteSimulator,
     };
     use solana_ledger::{blockstore::make_slot_entries, get_tmp_ledger_path};
     use solana_runtime::bank::Bank;
@@ -1390,12 +1291,13 @@ pub mod test {
         collections::HashMap,
         fs::{remove_file, OpenOptions},
         io::{Read, Seek, SeekFrom, Write},
+        path::PathBuf,
         sync::Arc,
     };
     use tempfile::TempDir;
     use trees::tr;
 
-    fn gen_stakes(stake_votes: &[(u64, &[u64])]) -> Vec<(Pubkey, (u64, ArcVoteAccount))> {
+    fn gen_stakes(stake_votes: &[(u64, &[u64])]) -> Vec<(Pubkey, (u64, VoteAccount))> {
         let mut stakes = vec![];
         for (lamports, votes) in stake_votes {
             let mut account = AccountSharedData::from(Account {
@@ -1414,7 +1316,7 @@ pub mod test {
             .expect("serialize state");
             stakes.push((
                 solana_sdk::pubkey::new_rand(),
-                (*lamports, ArcVoteAccount::from(account)),
+                (*lamports, VoteAccount::from(account)),
             ));
         }
         stakes
@@ -1469,7 +1371,7 @@ pub mod test {
         let mut cluster_votes = HashMap::new();
         let votes = vec![0, 1, 2, 3, 4, 5];
         cluster_votes.insert(node_pubkey, votes.clone());
-        vote_simulator.fill_bank_forks(forks, &cluster_votes);
+        vote_simulator.fill_bank_forks(forks, &cluster_votes, true);
 
         // Simulate the votes
         for vote in votes {
@@ -1526,7 +1428,7 @@ pub mod test {
                         / tr(112))));
 
         // Fill the BankForks according to the above fork structure
-        vote_simulator.fill_bank_forks(forks, &HashMap::new());
+        vote_simulator.fill_bank_forks(forks, &HashMap::new(), true);
         for (_, fork_progress) in vote_simulator.progress.iter_mut() {
             fork_progress.fork_stats.computed = true;
         }
@@ -1947,7 +1849,7 @@ pub mod test {
         let mut cluster_votes: HashMap<Pubkey, Vec<Slot>> = HashMap::new();
         cluster_votes.insert(vote_simulator.node_pubkeys[1], vec![46]);
         cluster_votes.insert(vote_simulator.node_pubkeys[2], vec![47]);
-        vote_simulator.fill_bank_forks(forks, &cluster_votes);
+        vote_simulator.fill_bank_forks(forks, &cluster_votes, true);
 
         // Vote on the first minor fork at slot 14, should succeed
         assert!(vote_simulator
@@ -2023,7 +1925,7 @@ pub mod test {
         // Make the other validator vote fork to pass the threshold checks
         let other_votes = my_votes.clone();
         cluster_votes.insert(vote_simulator.node_pubkeys[1], other_votes);
-        vote_simulator.fill_bank_forks(forks, &cluster_votes);
+        vote_simulator.fill_bank_forks(forks, &cluster_votes, true);
 
         // Simulate the votes.
         for vote in &my_votes {
@@ -2518,20 +2420,20 @@ pub mod test {
         F: Fn(&mut Tower, &Pubkey),
         G: Fn(&PathBuf),
     {
-        let dir = TempDir::new().unwrap();
+        let tower_path = TempDir::new().unwrap();
         let identity_keypair = Arc::new(Keypair::new());
+        let node_pubkey = identity_keypair.pubkey();
 
         // Use values that will not match the default derived from BankForks
         let mut tower = Tower::new_for_tests(10, 0.9);
-        tower.ledger_path = dir.path().to_path_buf();
-        tower.path = Tower::get_filename(&tower.ledger_path, &identity_keypair.pubkey());
-        tower.tmp_path = Tower::get_tmp_filename(&tower.path);
 
-        modify_original(&mut tower, &identity_keypair.pubkey());
+        let tower_storage = FileTowerStorage::new(tower_path.path().to_path_buf());
 
-        tower.save(&identity_keypair).unwrap();
-        modify_serialized(&tower.path);
-        let loaded = Tower::restore(dir.path(), &identity_keypair.pubkey());
+        modify_original(&mut tower, &node_pubkey);
+
+        tower.save(&tower_storage, &identity_keypair).unwrap();
+        modify_serialized(&tower_storage.filename(&node_pubkey));
+        let loaded = Tower::restore(&tower_storage, &node_pubkey);
 
         (tower, loaded)
     }
@@ -2567,7 +2469,7 @@ pub mod test {
                             / (tr(110) / tr(111))))));
 
         // Fill the BankForks according to the above fork structure
-        vote_simulator.fill_bank_forks(forks, &HashMap::new());
+        vote_simulator.fill_bank_forks(forks, &HashMap::new(), true);
         for (_, fork_progress) in vote_simulator.progress.iter_mut() {
             fork_progress.fork_stats.computed = true;
         }
@@ -2667,7 +2569,7 @@ pub mod test {
         let replayed_root_slot = 44;
 
         // Fill the BankForks according to the above fork structure
-        vote_simulator.fill_bank_forks(forks, &HashMap::new());
+        vote_simulator.fill_bank_forks(forks, &HashMap::new(), true);
         for (_, fork_progress) in vote_simulator.progress.iter_mut() {
             fork_progress.fork_stats.computed = true;
         }
@@ -2760,8 +2662,9 @@ pub mod test {
     fn test_load_tower_wrong_identity() {
         let identity_keypair = Arc::new(Keypair::new());
         let tower = Tower::default();
+        let tower_storage = FileTowerStorage::default();
         assert_matches!(
-            tower.save(&identity_keypair),
+            tower.save(&tower_storage, &identity_keypair),
             Err(TowerError::WrongTower(_))
         )
     }

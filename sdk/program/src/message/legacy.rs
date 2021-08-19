@@ -9,6 +9,7 @@ use crate::{
     bpf_loader, bpf_loader_deprecated, bpf_loader_upgradeable,
     hash::Hash,
     instruction::{AccountMeta, CompiledInstruction, Instruction},
+    message::MessageHeader,
     pubkey::Pubkey,
     short_vec, system_instruction, system_program, sysvar,
 };
@@ -18,7 +19,7 @@ use std::{convert::TryFrom, str::FromStr};
 
 lazy_static! {
     // Copied keys over since direct references create cyclical dependency.
-    static ref BUILTIN_PROGRAMS_KEYS: [Pubkey; 10] = {
+    pub static ref BUILTIN_PROGRAMS_KEYS: [Pubkey; 10] = {
         let parse = |s| Pubkey::from_str(s).unwrap();
         [
             parse("Config1111111111111111111111111111111111111"),
@@ -163,27 +164,8 @@ fn get_program_ids(instructions: &[Instruction]) -> Vec<Pubkey> {
         .collect()
 }
 
-pub const MESSAGE_HEADER_LENGTH: usize = 3;
-
-#[frozen_abi(digest = "BVC5RhetsNpheGipt5rUrkR6RDDUHtD5sCLK1UjymL4S")]
-#[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq, Clone, AbiExample)]
-#[serde(rename_all = "camelCase")]
-pub struct MessageHeader {
-    /// The number of signatures required for this message to be considered valid. The
-    /// signatures must match the first `num_required_signatures` of `account_keys`.
-    /// NOTE: Serialization-related changes must be paired with the direct read at sigverify.
-    pub num_required_signatures: u8,
-
-    /// The last num_readonly_signed_accounts of the signed keys are read-only accounts. Programs
-    /// may process multiple transactions that load read-only accounts within a single PoH entry,
-    /// but are not permitted to credit or debit lamports or modify account data. Transactions
-    /// targeting the same read-write account are evaluated sequentially.
-    pub num_readonly_signed_accounts: u8,
-
-    /// The last num_readonly_unsigned_accounts of the unsigned keys are read-only accounts.
-    pub num_readonly_unsigned_accounts: u8,
-}
-
+// NOTE: Serialization-related changes must be paired with the custom serialization
+// for versioned messages in the `RemainingLegacyMessage` struct.
 #[frozen_abi(digest = "2KnLEqfLcTBQqitE22Pp8JYkaqVVbAkGbCfdeHoyxcAU")]
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq, Clone, AbiExample)]
 #[serde(rename_all = "camelCase")]
@@ -387,6 +369,7 @@ impl Message {
         i < self.header.num_required_signatures as usize
     }
 
+    #[deprecated]
     pub fn get_account_keys_by_lock_type(&self) -> (Vec<&Pubkey>, Vec<&Pubkey>) {
         let mut writable_keys = vec![];
         let mut readonly_keys = vec![];
@@ -413,6 +396,7 @@ impl Message {
     //   35..67 - program_id
     //   67..69 - data len - u16
     //   69..data_len - data
+    #[deprecated]
     pub fn serialize_instructions(&self) -> Vec<u8> {
         // 64 bytes is a reasonable guess, calculating exactly is slower in benchmarks
         let mut data = Vec::with_capacity(self.instructions.len() * (32 * 2));
@@ -503,12 +487,27 @@ impl Message {
             .min(self.header.num_required_signatures as usize);
         self.account_keys[..last_key].iter().collect()
     }
+
+    /// Return true if account_keys has any duplicate keys
+    pub fn has_duplicates(&self) -> bool {
+        // Note: This is an O(n^2) algorithm, but requires no heap allocations. The benchmark
+        // `bench_has_duplicates` in benches/message_processor.rs shows that this implementation is
+        // ~50 times faster than using HashSet for very short slices.
+        for i in 1..self.account_keys.len() {
+            #[allow(clippy::integer_arithmetic)]
+            if self.account_keys[i..].contains(&self.account_keys[i - 1]) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(deprecated)]
     use super::*;
-    use crate::{hash, instruction::AccountMeta};
+    use crate::{hash, instruction::AccountMeta, message::MESSAGE_HEADER_LENGTH};
     use std::collections::HashSet;
 
     #[test]

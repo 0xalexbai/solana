@@ -35,7 +35,6 @@ use solana_sdk::{
     account_utils::StateMut,
     bpf_loader, bpf_loader_deprecated,
     bpf_loader_upgradeable::{self, UpgradeableLoaderState},
-    clock::Slot,
     commitment_config::CommitmentConfig,
     instruction::Instruction,
     instruction::InstructionError,
@@ -334,7 +333,7 @@ impl ProgramSubCommands for App<'_, '_> {
                 )
                 .subcommand(
                     SubCommand::with_name("close")
-                        .about("Close an acount and withdraw all lamports")
+                        .about("Close an account and withdraw all lamports")
                         .arg(
                             Arg::with_name("account")
                                 .index(1)
@@ -370,6 +369,39 @@ impl ProgramSubCommands for App<'_, '_> {
                                 .help("Display balance in lamports instead of SOL"),
                         ),
                 )
+        )
+        .subcommand(
+            SubCommand::with_name("deploy")
+                .about("Deploy a program")
+                .arg(
+                    Arg::with_name("program_location")
+                        .index(1)
+                        .value_name("PROGRAM_FILEPATH")
+                        .takes_value(true)
+                        .required(true)
+                        .help("/path/to/program.o"),
+                )
+                .arg(
+                    Arg::with_name("address_signer")
+                        .index(2)
+                        .value_name("PROGRAM_ADDRESS_SIGNER")
+                        .takes_value(true)
+                        .validator(is_valid_signer)
+                        .help("The signer for the desired address of the program [default: new random address]")
+                )
+                .arg(
+                    Arg::with_name("use_deprecated_loader")
+                        .long("use-deprecated-loader")
+                        .takes_value(false)
+                        .hidden(true) // Don't document this argument to discourage its use
+                        .help("Use the deprecated BPF loader")
+                )
+                .arg(
+                    Arg::with_name("allow_excessive_balance")
+                        .long("allow-excessive-deploy-account-balance")
+                        .takes_value(false)
+                        .help("Use the designated program id, even if the account already holds a large balance of SOL")
+                ),
         )
     }
 }
@@ -1034,7 +1066,7 @@ fn process_set_authority(
     };
 
     trace!("Set a new authority");
-    let (blockhash, _) = rpc_client.get_recent_blockhash()?;
+    let blockhash = rpc_client.get_latest_blockhash()?;
 
     let mut tx = if let Some(ref pubkey) = program_pubkey {
         Transaction::new_unsigned(Message::new(
@@ -1310,7 +1342,7 @@ fn close(
     recipient_pubkey: &Pubkey,
     authority_signer: &dyn Signer,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (blockhash, _) = rpc_client.get_recent_blockhash()?;
+    let blockhash = rpc_client.get_latest_blockhash()?;
 
     let mut tx = Transaction::new_unsigned(Message::new(
         &[bpf_loader_upgradeable::close(
@@ -1791,9 +1823,10 @@ fn read_and_verify_elf(program_location: &str) -> Result<Vec<u8>, Box<dyn std::e
     // Verify the program
     <dyn Executable<BpfError, ThisInstructionMeter>>::from_elf(
         &program_data,
-        Some(|x| verifier::check(x)),
+        Some(verifier::check),
         Config {
             reject_unresolved_syscalls: true,
+            verify_mul64_imm_nonzero: true, // TODO: Remove me after feature gate
             ..Config::default()
         },
         register_syscalls(&mut invoke_context).unwrap(),
@@ -1857,14 +1890,14 @@ fn check_payer(
     balance_needed: u64,
     messages: &[&Message],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (_, fee_calculator) = rpc_client.get_recent_blockhash()?;
+    let blockhash = rpc_client.get_latest_blockhash()?;
 
     // Does the payer have enough?
     check_account_for_spend_multiple_fees_with_commitment(
         rpc_client,
         &config.signers[0].pubkey(),
         balance_needed,
-        &fee_calculator,
+        &blockhash,
         messages,
         config.commitment,
     )?;
@@ -1886,7 +1919,7 @@ fn send_deploy_messages(
     if let Some(message) = initial_message {
         if let Some(initial_signer) = initial_signer {
             trace!("Preparing the required accounts");
-            let (blockhash, _) = rpc_client.get_recent_blockhash()?;
+            let blockhash = rpc_client.get_latest_blockhash()?;
 
             let mut initial_transaction = Transaction::new_unsigned(message.clone());
             // Most of the initial_transaction combinations require both the fee-payer and new program
@@ -1909,9 +1942,8 @@ fn send_deploy_messages(
     if let Some(write_messages) = write_messages {
         if let Some(write_signer) = write_signer {
             trace!("Writing program data");
-            let (blockhash, _, last_valid_slot) = rpc_client
-                .get_recent_blockhash_with_commitment(config.commitment)?
-                .value;
+            let (blockhash, last_valid_block_height) =
+                rpc_client.get_latest_blockhash_with_commitment(config.commitment)?;
             let mut write_transactions = vec![];
             for message in write_messages.iter() {
                 let mut tx = Transaction::new_unsigned(message.clone());
@@ -1925,7 +1957,7 @@ fn send_deploy_messages(
                 write_transactions,
                 &[payer_signer, write_signer],
                 config.commitment,
-                last_valid_slot,
+                last_valid_block_height,
             )
             .map_err(|err| format!("Data writes to account failed: {}", err))?;
         }
@@ -1934,7 +1966,7 @@ fn send_deploy_messages(
     if let Some(message) = final_message {
         if let Some(final_signers) = final_signers {
             trace!("Deploying program");
-            let (blockhash, _) = rpc_client.get_recent_blockhash()?;
+            let blockhash = rpc_client.get_latest_blockhash()?;
 
             let mut final_tx = Transaction::new_unsigned(message.clone());
             let mut signers = final_signers.to_vec();
@@ -1995,7 +2027,7 @@ fn send_and_confirm_transactions_with_spinner<T: Signers>(
     mut transactions: Vec<Transaction>,
     signer_keys: &T,
     commitment: CommitmentConfig,
-    mut last_valid_slot: Slot,
+    mut last_valid_block_height: u64,
 ) -> Result<(), Box<dyn error::Error>> {
     let progress_bar = new_spinner_progress_bar();
     let mut send_retries = 5;
@@ -2035,7 +2067,7 @@ fn send_and_confirm_transactions_with_spinner<T: Signers>(
 
         // Collect statuses for all the transactions, drop those that are confirmed
         loop {
-            let mut slot = 0;
+            let mut block_height = 0;
             let pending_signatures = pending_transactions.keys().cloned().collect::<Vec<_>>();
             for pending_signatures_chunk in
                 pending_signatures.chunks(MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS)
@@ -2060,12 +2092,12 @@ fn send_and_confirm_transactions_with_spinner<T: Signers>(
                     }
                 }
 
-                slot = rpc_client.get_slot()?;
+                block_height = rpc_client.get_block_height()?;
                 progress_bar.set_message(format!(
-                    "[{}/{}] Transactions confirmed. Retrying in {} slots",
+                    "[{}/{}] Transactions confirmed. Retrying in {} blocks",
                     num_transactions - pending_transactions.len(),
                     num_transactions,
-                    last_valid_slot.saturating_sub(slot)
+                    last_valid_block_height.saturating_sub(block_height)
                 ));
             }
 
@@ -2073,7 +2105,7 @@ fn send_and_confirm_transactions_with_spinner<T: Signers>(
                 return Ok(());
             }
 
-            if slot > last_valid_slot {
+            if block_height > last_valid_block_height {
                 break;
             }
 
@@ -2103,10 +2135,9 @@ fn send_and_confirm_transactions_with_spinner<T: Signers>(
         send_retries -= 1;
 
         // Re-sign any failed transactions with a new blockhash and retry
-        let (blockhash, _fee_calculator, new_last_valid_slot) = rpc_client
-            .get_recent_blockhash_with_commitment(commitment)?
-            .value;
-        last_valid_slot = new_last_valid_slot;
+        let (blockhash, new_last_valid_block_height) =
+            rpc_client.get_latest_blockhash_with_commitment(commitment)?;
+        last_valid_block_height = new_last_valid_block_height;
         transactions = vec![];
         for (_, mut transaction) in pending_transactions.into_iter() {
             transaction.try_sign(signer_keys, blockhash)?;
@@ -2118,7 +2149,10 @@ fn send_and_confirm_transactions_with_spinner<T: Signers>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{app, parse_command, process_command};
+    use crate::{
+        clap_app::get_clap_app,
+        cli::{parse_command, process_command},
+    };
     use serde_json::Value;
     use solana_cli_output::OutputFormat;
     use solana_sdk::signature::write_keypair_file;
@@ -2140,7 +2174,7 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_cli_parse_deploy() {
-        let test_commands = app("test", "desc", "version");
+        let test_commands = get_clap_app("test", "desc", "version");
 
         let default_keypair = Keypair::new();
         let keypair_file = make_tmp_path("keypair_file");
@@ -2348,7 +2382,7 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_cli_parse_write_buffer() {
-        let test_commands = app("test", "desc", "version");
+        let test_commands = get_clap_app("test", "desc", "version");
 
         let default_keypair = Keypair::new();
         let keypair_file = make_tmp_path("keypair_file");
@@ -2496,7 +2530,7 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_cli_parse_set_upgrade_authority() {
-        let test_commands = app("test", "desc", "version");
+        let test_commands = get_clap_app("test", "desc", "version");
 
         let default_keypair = Keypair::new();
         let keypair_file = make_tmp_path("keypair_file");
@@ -2604,7 +2638,7 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_cli_parse_set_buffer_authority() {
-        let test_commands = app("test", "desc", "version");
+        let test_commands = get_clap_app("test", "desc", "version");
 
         let default_keypair = Keypair::new();
         let keypair_file = make_tmp_path("keypair_file");
@@ -2661,7 +2695,7 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_cli_parse_show() {
-        let test_commands = app("test", "desc", "version");
+        let test_commands = get_clap_app("test", "desc", "version");
 
         let default_keypair = Keypair::new();
         let keypair_file = make_tmp_path("keypair_file");
@@ -2760,7 +2794,7 @@ mod tests {
     #[test]
     #[allow(clippy::cognitive_complexity)]
     fn test_cli_parse_close() {
-        let test_commands = app("test", "desc", "version");
+        let test_commands = get_clap_app("test", "desc", "version");
 
         let default_keypair = Keypair::new();
         let keypair_file = make_tmp_path("keypair_file");
